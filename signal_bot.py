@@ -13,14 +13,17 @@ from sklearn.pipeline import Pipeline
 # ============================================================
 # Telegram & behavior
 # ============================================================
-DEBUG_NO_TELEGRAM = False       # True yaparsan Telegram yerine sadece loga yazar
+DEBUG_NO_TELEGRAM = False      # True yaparsan Telegram yerine sadece loga yazar
 SEND_NO_TRADE = True           # True yaparsan NO-TRADE günlerinde de telegram mesajı atar
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
 def send_telegram(text: str) -> None:
-    """Never print token/url. Never include exception text (may contain token)."""
+    """
+    Token/URL/exception text BASMA.
+    GitHub secret masking logları boşaltabiliyor.
+    """
     if DEBUG_NO_TELEGRAM:
         print("DEBUG_NO_TELEGRAM=True -> Telegram kapalı. Mesaj:\n")
         print(text)
@@ -32,18 +35,14 @@ def send_telegram(text: str) -> None:
         return
 
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-
     try:
         r = requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text}, timeout=25)
         if r.status_code != 200:
-            # response text token içermez ama gene de kısalt
+            # response text token içermez ama gene de KISITLI bilgi
             raise RuntimeError(f"Telegram HTTP {r.status_code}")
-    except Exception as _:
+    except Exception:
         # ASLA exception metni basma (içinde token'lı URL geçebiliyor!)
         raise RuntimeError("Telegram send failed (network/api).")
-    except Exception as e:
-        # URL/token basma!
-        raise RuntimeError(f"Telegram send exception: {type(e).__name__}: {str(e)[:200]}")
 
 # ============================================================
 # Symbols (Stooq daily)
@@ -123,7 +122,6 @@ def fetch_ohlc_stooq(symbol: str, retries: int = 3, sleep_s: float = 1.0) -> pd.
             df = df.sort_values("Date").set_index("Date")
             df = df[["Open", "High", "Low", "Close"]].dropna()
 
-            # Çok kısa veri -> anlamsız
             if len(df) < 400:
                 raise RuntimeError(f"Too few rows: {len(df)}")
 
@@ -146,7 +144,6 @@ def make_features(xau_close: pd.Series, dxy_close: pd.Series, us10y_close: pd.Se
         axis=1,
     ).dropna()
 
-    # log returns
     df["x_ret1"] = np.log(df["xau"]).diff()
     df["x_ret3"] = np.log(df["xau"]).diff(3)
     df["x_ret5"] = np.log(df["xau"]).diff(5)
@@ -154,14 +151,12 @@ def make_features(xau_close: pd.Series, dxy_close: pd.Series, us10y_close: pd.Se
     df["dxy_ret1"] = np.log(df["dxy"]).diff()
     df["dxy_ret5"] = np.log(df["dxy"]).diff(5)
 
-    # yields: difference (not log)
     df["us10y_chg1"] = df["us10y"].diff()
     df["us10y_chg5"] = df["us10y"].diff(5)
 
     df["vix_ret1"] = np.log(df["vix"]).diff()
     df["vix_ret5"] = np.log(df["vix"]).diff(5)
 
-    # trend filter
     df["ma50"] = df["xau"].rolling(50).mean()
     df["trend_up"] = (df["xau"] > df["ma50"]).astype(int)
 
@@ -171,16 +166,15 @@ def make_features(xau_close: pd.Series, dxy_close: pd.Series, us10y_close: pd.Se
 # Main
 # ============================================================
 def main():
-
+    # Telegram bağlantısı çalışıyor mu testi
     send_telegram("TEST: Bot çalıştı")
 
-    df = download_data()
+    print("Downloading data...")
     xau = fetch_ohlc_stooq(XAU)
     dxy = fetch_ohlc_stooq(DXY)
     us10y = fetch_ohlc_stooq(US10Y)
     vix = fetch_ohlc_stooq(VIX)
 
-    # ATR on XAU
     xau2 = xau.copy()
     xau2["ATR"] = compute_atr(xau2, ATR_LEN)
 
@@ -192,7 +186,6 @@ def main():
     )
     feats = feats.join(xau2["ATR"].rename("atr"), how="left").dropna()
 
-    # label: tomorrow up?
     feats["y"] = (feats["xau"].shift(-1) > feats["xau"]).astype(int)
     feats = feats.dropna()
 
@@ -209,10 +202,8 @@ def main():
 
     X = feats[feature_cols]
     y = feats["y"]
-
     last_day = feats.index[-1]
 
-    # train on last TRAIN_DAYS ending at yesterday (exclude last_day from train)
     X_train = X.iloc[-TRAIN_DAYS-1:-1]
     y_train = y.iloc[-TRAIN_DAYS-1:-1]
     X_last = X.loc[[last_day]]
@@ -228,7 +219,6 @@ def main():
     in_uptrend = int(feats.loc[last_day, "trend_up"]) == 1
     trend_txt = "UP" if in_uptrend else "DOWN"
 
-    # strict signal rules (az ama kaliteli)
     side = "NO-TRADE"
     if p_up > TH_LONG and in_uptrend:
         side = "LONG"
@@ -249,7 +239,6 @@ def main():
             send_telegram(msg)
         return
 
-    # SL/TP
     if side == "LONG":
         sl = entry - stop_dist
         tp = entry + RR * stop_dist
@@ -257,11 +246,9 @@ def main():
         sl = entry + stop_dist
         tp = entry - RR * stop_dist
 
-    # position size
     lot_raw = lot_from_risk(stop_dist, RISK_USD)
     lot = round_down(lot_raw, LOT_STEP)
 
-    # min lot handling
     min_lot_risk = MIN_LOT * stop_dist * LOT_OZ
     lot_note = ""
     if lot < MIN_LOT:
@@ -292,13 +279,8 @@ if __name__ == "__main__":
     try:
         main()
     except Exception as e:
-        # Token/URL asla print etmiyoruz
         import traceback
-        print("FATAL ERROR:", f"{type(e).__name__}: {str(e)[:200]}")
+        # Token/URL asla print etmiyoruz ama hata türünü basabiliriz:
+        print("FATAL ERROR:", f"{type(e).__name__}")
         traceback.print_exc()
         raise
-
-
-
-
-
