@@ -88,6 +88,7 @@ def fetch_optional(symbols: list[str], label: str) -> tuple[pd.DataFrame | None,
             return df, sym
         except Exception:
             pass
+
     # optional fail
     send_telegram(f"⚠️ {label} verisi alınamadı ({'/'.join(symbols)}). Bugün {label} features devre dışı.")
     return None, None
@@ -97,16 +98,20 @@ def fetch_optional(symbols: list[str], label: str) -> tuple[pd.DataFrame | None,
 # ============================================================
 XAU = "xauusd"  # required
 
-DXY_CANDIDATES  = ["dx.f", "usd_i", "usdidx"]
-VIX_CANDIDATES  = ["vi.f", "vix"]          # vix bazen çalışıyor
-US10Y_CANDIDATES = ["10yusy.b", "us10y"]   # alternatif
+DXY_CANDIDATES   = ["dx.f", "usd_i", "usdidx"]
+VIX_CANDIDATES   = ["vi.f", "vix"]
+US10Y_CANDIDATES = ["10yusy.b", "us10y"]
 
 # ============================================================
-# Strategy / risk config
+# Strategy / risk config (EN KALİTELİ MOD)
 # ============================================================
 TRAIN_DAYS = 252 * 5
 TH_LONG = 0.65
 TH_SHORT = 0.35
+
+# En kaliteli filtreler:
+REQUIRE_VIX_FOR_TRADE = True   # VIX yoksa TRADE yok
+MIN_EDGE = 0.17                # p_up - 0.5 en az 0.17 olsun (noise azaltır)
 
 ATR_LEN = 14
 STOP_ATR_MULT = 2.0
@@ -161,27 +166,22 @@ def make_features(xau_close: pd.Series,
 
     df = pd.concat(series, axis=1).dropna()
 
-    # XAU returns
     df["x_ret1"] = np.log(df["xau"]).diff()
     df["x_ret3"] = np.log(df["xau"]).diff(3)
     df["x_ret5"] = np.log(df["xau"]).diff(5)
 
-    # DXY returns (optional)
     if "dxy" in df.columns:
         df["dxy_ret1"] = np.log(df["dxy"]).diff()
         df["dxy_ret5"] = np.log(df["dxy"]).diff(5)
 
-    # US10Y chg (optional)
     if "us10y" in df.columns:
         df["us10y_chg1"] = df["us10y"].diff()
         df["us10y_chg5"] = df["us10y"].diff(5)
 
-    # VIX returns (optional)
     if "vix" in df.columns:
         df["vix_ret1"] = np.log(df["vix"]).diff()
         df["vix_ret5"] = np.log(df["vix"]).diff(5)
 
-    # Trend filter always
     df["ma50"] = df["xau"].rolling(50).mean()
     df["trend_up"] = (df["xau"] > df["ma50"]).astype(int)
 
@@ -216,7 +216,7 @@ def main():
     feats["y"] = (feats["xau"].shift(-1) > feats["xau"]).astype(int)
     feats = feats.dropna()
 
-    # Build feature list dynamically
+    # Dynamic feature list
     feature_cols = ["x_ret1", "x_ret3", "x_ret5"]
     if "dxy_ret1" in feats.columns and "dxy_ret5" in feats.columns:
         feature_cols += ["dxy_ret1", "dxy_ret5"]
@@ -248,11 +248,18 @@ def main():
     in_uptrend = int(feats.loc[last_day, "trend_up"]) == 1
     trend_txt = "UP" if in_uptrend else "DOWN"
 
+    vix_available = used_vix is not None
+    reason = ""
+
+    # Strict rules (EN KALİTELİ)
     side = "NO-TRADE"
-    if p_up > TH_LONG and in_uptrend:
-        side = "LONG"
-    elif p_up < TH_SHORT and (not in_uptrend):
-        side = "SHORT"
+    if REQUIRE_VIX_FOR_TRADE and not vix_available:
+        reason = "VIX missing -> quality filter"
+    else:
+        if (p_up > TH_LONG) and ((p_up - 0.5) >= MIN_EDGE) and in_uptrend:
+            side = "LONG"
+        elif (p_up < TH_SHORT) and ((0.5 - p_up) >= MIN_EDGE) and (not in_uptrend):
+            side = "SHORT"
 
     entry = float(feats.loc[last_day, "xau"])
     atr = float(feats.loc[last_day, "atr"])
@@ -267,6 +274,8 @@ def main():
 
     header = f"GOLD AI SIGNAL (XAUUSD)\nDate: {last_day.date()}\n"
     info = src + f"P(up): {p_up:.4f}\nTrend(>MA50): {trend_txt}\n"
+    if reason:
+        info += f"Filter: {reason}\n"
 
     if side == "NO-TRADE":
         msg = header + "\n" + info + "\nSignal: NO-TRADE"
@@ -275,6 +284,7 @@ def main():
             send_telegram(msg)
         return
 
+    # SL/TP
     if side == "LONG":
         sl = entry - stop_dist
         tp = entry + RR * stop_dist
@@ -282,6 +292,7 @@ def main():
         sl = entry + stop_dist
         tp = entry - RR * stop_dist
 
+    # position size
     lot_raw = lot_from_risk(stop_dist, RISK_USD)
     lot = round_down(lot_raw, LOT_STEP)
 
