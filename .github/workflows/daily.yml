@@ -2,11 +2,12 @@ name: Gold AI Signal
 
 on:
   workflow_dispatch:
+  schedule:
+    - cron: "0 22 * * 1-5"
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -18,12 +19,31 @@ jobs:
 
       - name: Install packages
         run: |
+          set -euxo pipefail
+          python -V
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+          ls -la
 
-      - name: Run bot
+      # Logu DOSYAYA yaz (UI gizlese bile dosyada durur)
+      - name: Run bot (log to file)
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          python signal_bot.py
+          set +e
+          echo "=== START ===" > runlog.txt
+          python -u -X faulthandler signal_bot.py >> runlog.txt 2>&1
+          echo "EXIT_CODE=$?" >> runlog.txt
+          echo "=== LAST 120 LINES ==="
+          tail -n 120 runlog.txt || true
+          # workflow kırmızı olsun ama log kalsın:
+          grep -q "EXIT_CODE=0" runlog.txt || exit 1
+
+      - name: Upload run log artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: runlog
+          path: runlog.txt
+          if-no-files-found: error
