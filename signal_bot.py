@@ -20,24 +20,27 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
 def send_telegram(text: str) -> None:
-    """Never print token/url to avoid GitHub secret masking issues."""
+    """Never print token/url. Never include exception text (may contain token)."""
     if DEBUG_NO_TELEGRAM:
         print("DEBUG_NO_TELEGRAM=True -> Telegram kapalı. Mesaj:\n")
         print(text)
         return
 
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        # Token/ChatID yoksa sadece loga yaz
         print("Telegram secrets eksik (TELEGRAM_TOKEN / TELEGRAM_CHAT_ID). Mesaj:\n")
         print(text)
         return
 
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+
     try:
         r = requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text}, timeout=25)
         if r.status_code != 200:
-            # URL/token basma!
-            raise RuntimeError(f"Telegram HTTP {r.status_code}, body={r.text[:200]}")
+            # response text token içermez ama gene de kısalt
+            raise RuntimeError(f"Telegram HTTP {r.status_code}")
+    except Exception as _:
+        # ASLA exception metni basma (içinde token'lı URL geçebiliyor!)
+        raise RuntimeError("Telegram send failed (network/api).")
     except Exception as e:
         # URL/token basma!
         raise RuntimeError(f"Telegram send exception: {type(e).__name__}: {str(e)[:200]}")
@@ -291,5 +294,6 @@ if __name__ == "__main__":
         print("FATAL ERROR:", f"{type(e).__name__}: {str(e)[:200]}")
         traceback.print_exc()
         raise
+
 
 
