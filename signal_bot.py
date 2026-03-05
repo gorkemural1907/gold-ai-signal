@@ -31,7 +31,7 @@ def send_telegram(text: str) -> None:
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
         "text": text,
-        "disable_web_page_preview": True,  # ✅ Tip.Us gibi link preview’leri kapatır
+        "disable_web_page_preview": True,  # link preview kapalı
     }
     try:
         r = requests.post(url, json=payload, timeout=25)
@@ -41,7 +41,7 @@ def send_telegram(text: str) -> None:
         raise RuntimeError("Telegram send failed (network/api).")
 
 # ============================================================
-# Stooq download
+# Stooq download (rate-limit friendly)
 # ============================================================
 SESSION = requests.Session()
 SESSION.headers.update({
@@ -101,43 +101,39 @@ def fetch_optional(symbols: list[str], label: str) -> tuple[pd.DataFrame | None,
     send_telegram(f"⚠️ {label} verisi alınamadı ({'/'.join(symbols)}). Bugün {label} features devre dışı.")
     return None, None
 
-def fetch_required_with_sanity(symbols: list[str], label: str) -> tuple[pd.DataFrame, str]:
+def fetch_required_xau_with_dynamic_sanity(symbol: str = "xauusd") -> pd.DataFrame:
     """
-    Required data with sanity check.
-    For XAUUSD: reject absurd last close (data glitch / wrong series).
+    XAU required + dinamik sanity:
+    - Son 60 gün medyanına göre band (0.5x .. 2.0x)
+    - Günlük jump > 25% ise şüpheli
     """
-    last_errors = []
-    for sym in symbols:
-        try:
-            df = fetch_ohlc_stooq(sym)
+    df = fetch_ohlc_stooq(symbol)
+    closes = df["Close"].astype(float).dropna()
+    if len(closes) < 180:
+        raise RuntimeError(f"XAU sanity needs more history: rows={len(closes)}")
 
-            last_close = float(df["Close"].iloc[-1])
-            # ✅ XAUUSD sanity band (çok geniş ama 5141 gibi anomalileri elemek için)
-            # 2026 spot altın için 600-3500 bandı güvenli.
-            if label == "XAU":
-                if not (600.0 <= last_close <= 3500.0):
-                    raise RuntimeError(f"Sanity fail: last_close={last_close:.2f}")
+    last_close = float(closes.iloc[-1])
+    prev_close = float(closes.iloc[-2])
 
-                # Ek koruma: son 1 günde aşırı sıçrama varsa (data glitch)
-                if len(df) > 10:
-                    prev_close = float(df["Close"].iloc[-2])
-                    if prev_close > 0:
-                        jump = abs(last_close / prev_close - 1.0)
-                        if jump > 0.12:  # %12 üstü günlük hareket = şüpheli veri
-                            raise RuntimeError(f"Sanity fail: 1d jump={jump:.2%}")
+    med60 = float(closes.iloc[-60:].median())
+    lo = 0.50 * med60
+    hi = 2.00 * med60
+    if not (lo <= last_close <= hi):
+        raise RuntimeError(
+            f"XAU sanity fail: last_close={last_close:.2f} not in [{lo:.2f},{hi:.2f}] (med60={med60:.2f})"
+        )
 
-            return df, sym
+    if prev_close > 0:
+        jump = abs(last_close / prev_close - 1.0)
+        if jump > 0.25:
+            raise RuntimeError(f"XAU sanity fail: 1d jump={jump:.2%}")
 
-        except Exception as e:
-            last_errors.append(f"{sym}: {type(e).__name__}: {str(e)[:120]}")
-
-    raise RuntimeError(f"{label} fetch failed for all candidates. Last errors: " + " | ".join(last_errors[-4:]))
+    return df
 
 # ============================================================
-# Symbols
+# Symbols (fallback lists)
 # ============================================================
-# XAU için aday liste (bazen stooq'ta seri “sapıtabiliyor”)
-XAU_CANDIDATES = ["xauusd", "xauusd.f", "xauusd.c"]
+XAU_SYMBOL = "xauusd"  # tek kullanıyoruz (diğerleri boş dönüyordu)
 
 DXY_CANDIDATES    = ["dx.f", "usd_i", "usdidx"]
 US10Y_CANDIDATES  = ["10yusy.b", "us10y"]
@@ -145,6 +141,7 @@ SPX_CANDIDATES    = ["^spx"]
 TIPS_CANDIDATES   = ["tip.us"]
 IEF_CANDIDATES    = ["ief.us"]
 
+# VIX için geniş fallback
 VIX_CANDIDATES    = ["vi.f", "vix", "^vix", "vix.f"]
 
 # ============================================================
@@ -159,9 +156,11 @@ MIN_EDGE = 0.12
 # VIX varsa kullan; yoksa SPX proxy ile devam
 REQUIRE_VIX_FOR_TRADE = False
 
+# VIX yoksa devreye girer
 SPX_RISK_PROXY_ON = True
-SPX_RET5_ABS_MAX = 0.03
+SPX_RET5_ABS_MAX = 0.03  # abs(spx_ret5) > 3% ise NO-TRADE
 
+# TIP/IEF real-rate proxy bias
 REAL_FACTOR_LOOKBACK = 5
 REAL_BIAS = 0.015
 
@@ -177,12 +176,13 @@ LOT_OZ = 100.0
 MIN_LOT = 0.01
 LOT_STEP = 0.01
 
+# Spread (10 bps)
 SPREAD_BPS = 10
 SPREAD = SPREAD_BPS / 10000.0
 HALF_SPREAD = SPREAD / 2.0
 
 # ============================================================
-# Indicators
+# Indicators / helpers
 # ============================================================
 def compute_atr(ohlc: pd.DataFrame, n: int) -> pd.Series:
     prev_close = ohlc["Close"].shift(1)
@@ -260,10 +260,12 @@ def make_features(
         df["tips_ret1"] = np.log(df["tips"]).diff()
         df["tips_ret5"] = np.log(df["tips"]).diff(5)
 
+    # TIP/IEF real-rate proxy
     if "tips" in df.columns and "ief" in df.columns:
         df["real_factor"] = np.log(df["tips"] / df["ief"])
         df["real_f_chg5"] = df["real_factor"].diff(REAL_FACTOR_LOOKBACK)
 
+    # Trend filter
     df["ma50"] = df["xau"].rolling(50).mean()
     df["trend_up"] = (df["xau"] > df["ma50"]).astype(int)
 
@@ -275,8 +277,9 @@ def make_features(
 def main():
     print("Downloading data...")
 
-    # ✅ XAU required + sanity + fallback
-    xau, used_xau = fetch_required_with_sanity(XAU_CANDIDATES, "XAU")
+    # Required XAU (dinamik sanity)
+    xau = fetch_required_xau_with_dynamic_sanity(XAU_SYMBOL)
+    used_xau = XAU_SYMBOL
 
     dxy, used_dxy = fetch_optional(DXY_CANDIDATES, "DXY")
     us10y, used_us10y = fetch_optional(US10Y_CANDIDATES, "US10Y")
@@ -339,6 +342,7 @@ def main():
     in_uptrend = int(feats.loc[last_day, "trend_up"]) == 1
     trend_txt = "UP" if in_uptrend else "DOWN"
 
+    # Real bias
     real_available = "real_f_chg5" in feats.columns
     real_chg5 = float(feats.loc[last_day, "real_f_chg5"]) if real_available else float("nan")
 
@@ -356,6 +360,7 @@ def main():
 
     p_up_adj = clamp01(p_up + bias)
 
+    # Risk gate: VIX varsa VIX, yoksa SPX proxy
     vix_available = used_vix is not None
     risk_gate = "VIX" if vix_available else "SPX_PROXY"
     reason = ""
@@ -364,7 +369,6 @@ def main():
         side = "NO-TRADE"
         reason = "VIX missing -> quality filter"
     else:
-        # SPX proxy guardrail if VIX missing
         if (not vix_available) and SPX_RISK_PROXY_ON:
             if "spx_ret5" in feats.columns:
                 spx_ret5 = float(feats.loc[last_day, "spx_ret5"])
@@ -417,7 +421,10 @@ def main():
         + f"RiskGate: {risk_gate}\n"
         + f"Spread: {SPREAD_BPS} bps (±{SPREAD_BPS/2:.1f} bps)\n"
     )
-    info += f"RealFactor chg{REAL_FACTOR_LOOKBACK}: {real_chg5:+.4f}\n" if real_available else f"RealFactor chg{REAL_FACTOR_LOOKBACK}: N/A\n"
+    if real_available:
+        info += f"RealFactor chg{REAL_FACTOR_LOOKBACK}: {real_chg5:+.4f}\n"
+    else:
+        info += f"RealFactor chg{REAL_FACTOR_LOOKBACK}: N/A\n"
     if reason:
         info += f"Filter: {reason}\n"
 
