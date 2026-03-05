@@ -219,4 +219,11 @@ def main():
     send_telegram(msg)
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        import traceback
+        print("FATAL ERROR:", repr(e))
+        traceback.print_exc()
+        raise
+
