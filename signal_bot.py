@@ -13,24 +13,19 @@ from sklearn.pipeline import Pipeline
 # ============================================================
 # Telegram & behavior
 # ============================================================
-DEBUG_NO_TELEGRAM = False      # True yaparsan Telegram yerine sadece loga yazar
-SEND_NO_TRADE = True           # NO-TRADE günlerinde de telegram mesajı at
+DEBUG_NO_TELEGRAM = False
+SEND_NO_TRADE = True
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
 def send_telegram(text: str) -> None:
-    """
-    Token/URL/exception text BASMA.
-    GitHub secret masking logları boşaltabiliyor.
-    """
+    # Token/URL/exception text basma (GitHub mask issues)
     if DEBUG_NO_TELEGRAM:
-        print("DEBUG_NO_TELEGRAM=True -> Telegram kapalı. Mesaj:\n")
         print(text)
         return
 
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        print("Telegram secrets eksik (TELEGRAM_TOKEN / TELEGRAM_CHAT_ID). Mesaj:\n")
         print(text)
         return
 
@@ -40,68 +35,15 @@ def send_telegram(text: str) -> None:
         if r.status_code != 200:
             raise RuntimeError(f"Telegram HTTP {r.status_code}")
     except Exception:
-        # ASLA exception metni basma (içinde token'lı URL geçebiliyor!)
         raise RuntimeError("Telegram send failed (network/api).")
 
 # ============================================================
-# Symbols (Stooq daily)
+# Stooq
 # ============================================================
-XAU = "xauusd"
-US10Y = "10yusy.b"
-VIX = "vi.f"
-
-# DXY bazen boş dönebiliyor -> fallback listesi
-DXY_CANDIDATES = ["dx.f", "usd_i", "usdidx"]
-
 def stooq_url(symbol: str) -> str:
     return f"https://stooq.com/q/d/l/?s={symbol}&i=d"
 
-# ============================================================
-# Strategy / risk config
-# ============================================================
-TRAIN_DAYS = 252 * 5      # 5 yıl
-TH_LONG = 0.65
-TH_SHORT = 0.35
-
-ATR_LEN = 14
-STOP_ATR_MULT = 2.0
-RR = 2.0
-
-ACCOUNT_USD = 1000.0
-RISK_PCT = 1.0
-RISK_USD = ACCOUNT_USD * (RISK_PCT / 100.0)
-
-LOT_OZ = 100.0            # 1.00 lot = 100 oz varsayımı
-MIN_LOT = 0.01
-LOT_STEP = 0.01
-
-# ============================================================
-# Helpers
-# ============================================================
-def round_down(x: float, step: float) -> float:
-    return math.floor(x / step) * step if step > 0 else x
-
-def lot_from_risk(stop_distance_usd: float, risk_usd: float) -> float:
-    if stop_distance_usd <= 0:
-        return 0.0
-    return risk_usd / (stop_distance_usd * LOT_OZ)
-
-def compute_atr(ohlc: pd.DataFrame, n: int) -> pd.Series:
-    prev_close = ohlc["Close"].shift(1)
-    tr = pd.concat(
-        [
-            (ohlc["High"] - ohlc["Low"]).rename("hl"),
-            (ohlc["High"] - prev_close).abs().rename("hc"),
-            (ohlc["Low"] - prev_close).abs().rename("lc"),
-        ],
-        axis=1,
-    ).max(axis=1)
-    return tr.rolling(n).mean()
-
-def fetch_ohlc_stooq(symbol: str, retries: int = 4, sleep_s: float = 1.5) -> pd.DataFrame:
-    """
-    Download OHLC from Stooq (daily). Retry + validate columns/rows.
-    """
+def fetch_ohlc_stooq(symbol: str, retries: int = 5, sleep_s: float = 2.0) -> pd.DataFrame:
     url = stooq_url(symbol)
     last_err = None
 
@@ -124,7 +66,7 @@ def fetch_ohlc_stooq(symbol: str, retries: int = 4, sleep_s: float = 1.5) -> pd.
             df = df.sort_values("Date").set_index("Date")
             df = df[["Open", "High", "Low", "Close"]].dropna()
 
-            if len(df) < 400:
+            if len(df) < 300:
                 raise RuntimeError(f"Too few rows: {len(df)}")
 
             return df
@@ -135,44 +77,111 @@ def fetch_ohlc_stooq(symbol: str, retries: int = 4, sleep_s: float = 1.5) -> pd.
 
     raise RuntimeError(f"Stooq fetch failed for {symbol}: {type(last_err).__name__}: {str(last_err)[:200]}")
 
-def fetch_dxy_with_fallback() -> tuple[pd.DataFrame | None, str | None]:
+def fetch_optional(symbols: list[str], label: str) -> tuple[pd.DataFrame | None, str | None]:
     """
-    Try multiple DXY symbols. Return (df, used_symbol).
+    Try symbols in order. Return (df, used_symbol).
     If all fail -> (None, None).
     """
-    last_err = None
-    for sym in DXY_CANDIDATES:
+    for sym in symbols:
         try:
-            df = fetch_ohlc_stooq(sym, retries=6, sleep_s=2.0)
+            df = fetch_ohlc_stooq(sym)
             return df, sym
-        except Exception as e:
-            last_err = e
-
-    # DXY yok -> None
+        except Exception:
+            pass
+    # optional fail
+    send_telegram(f"⚠️ {label} verisi alınamadı ({'/'.join(symbols)}). Bugün {label} features devre dışı.")
     return None, None
 
-def make_features(xau_close: pd.Series, dxy_close: pd.Series | None, us10y_close: pd.Series, vix_close: pd.Series) -> pd.DataFrame:
-    # DXY yoksa hiç eklemeyelim, sonra feature_cols'ta da çıkartacağız
-    series = [xau_close.rename("xau"), us10y_close.rename("us10y"), vix_close.rename("vix")]
+# ============================================================
+# Symbols (fallback lists)
+# ============================================================
+XAU = "xauusd"  # required
+
+DXY_CANDIDATES  = ["dx.f", "usd_i", "usdidx"]
+VIX_CANDIDATES  = ["vi.f", "vix"]          # vix bazen çalışıyor
+US10Y_CANDIDATES = ["10yusy.b", "us10y"]   # alternatif
+
+# ============================================================
+# Strategy / risk config
+# ============================================================
+TRAIN_DAYS = 252 * 5
+TH_LONG = 0.65
+TH_SHORT = 0.35
+
+ATR_LEN = 14
+STOP_ATR_MULT = 2.0
+RR = 2.0
+
+ACCOUNT_USD = 1000.0
+RISK_PCT = 1.0
+RISK_USD = ACCOUNT_USD * (RISK_PCT / 100.0)
+
+LOT_OZ = 100.0
+MIN_LOT = 0.01
+LOT_STEP = 0.01
+
+# ============================================================
+# Indicators
+# ============================================================
+def compute_atr(ohlc: pd.DataFrame, n: int) -> pd.Series:
+    prev_close = ohlc["Close"].shift(1)
+    tr = pd.concat(
+        [
+            (ohlc["High"] - ohlc["Low"]).rename("hl"),
+            (ohlc["High"] - prev_close).abs().rename("hc"),
+            (ohlc["Low"] - prev_close).abs().rename("lc"),
+        ],
+        axis=1,
+    ).max(axis=1)
+    return tr.rolling(n).mean()
+
+def round_down(x: float, step: float) -> float:
+    return math.floor(x / step) * step if step > 0 else x
+
+def lot_from_risk(stop_distance_usd: float, risk_usd: float) -> float:
+    if stop_distance_usd <= 0:
+        return 0.0
+    return risk_usd / (stop_distance_usd * LOT_OZ)
+
+# ============================================================
+# Features
+# ============================================================
+def make_features(xau_close: pd.Series,
+                  dxy_close: pd.Series | None,
+                  us10y_close: pd.Series | None,
+                  vix_close: pd.Series | None) -> pd.DataFrame:
+
+    series = [xau_close.rename("xau")]
     if dxy_close is not None:
-        series.insert(1, dxy_close.rename("dxy"))
+        series.append(dxy_close.rename("dxy"))
+    if us10y_close is not None:
+        series.append(us10y_close.rename("us10y"))
+    if vix_close is not None:
+        series.append(vix_close.rename("vix"))
 
     df = pd.concat(series, axis=1).dropna()
 
+    # XAU returns
     df["x_ret1"] = np.log(df["xau"]).diff()
     df["x_ret3"] = np.log(df["xau"]).diff(3)
     df["x_ret5"] = np.log(df["xau"]).diff(5)
 
+    # DXY returns (optional)
     if "dxy" in df.columns:
         df["dxy_ret1"] = np.log(df["dxy"]).diff()
         df["dxy_ret5"] = np.log(df["dxy"]).diff(5)
 
-    df["us10y_chg1"] = df["us10y"].diff()
-    df["us10y_chg5"] = df["us10y"].diff(5)
+    # US10Y chg (optional)
+    if "us10y" in df.columns:
+        df["us10y_chg1"] = df["us10y"].diff()
+        df["us10y_chg5"] = df["us10y"].diff(5)
 
-    df["vix_ret1"] = np.log(df["vix"]).diff()
-    df["vix_ret5"] = np.log(df["vix"]).diff(5)
+    # VIX returns (optional)
+    if "vix" in df.columns:
+        df["vix_ret1"] = np.log(df["vix"]).diff()
+        df["vix_ret5"] = np.log(df["vix"]).diff(5)
 
+    # Trend filter always
     df["ma50"] = df["xau"].rolling(50).mean()
     df["trend_up"] = (df["xau"] > df["ma50"]).astype(int)
 
@@ -184,16 +193,13 @@ def make_features(xau_close: pd.Series, dxy_close: pd.Series | None, us10y_close
 def main():
     print("Downloading data...")
 
+    # Required
     xau = fetch_ohlc_stooq(XAU)
-    us10y = fetch_ohlc_stooq(US10Y)
-    vix = fetch_ohlc_stooq(VIX)
 
-    dxy, used_dxy = fetch_dxy_with_fallback()
-    dxy_close = dxy["Close"] if dxy is not None else None
-
-    if dxy is None:
-        # DXY yok ama sistem dursun istemiyoruz
-        send_telegram("⚠️ DXY verisi alınamadı (dx.f/usd_i/usdidx). Bugün DXY features devre dışı.")
+    # Optional with fallback
+    dxy, used_dxy = fetch_optional(DXY_CANDIDATES, "DXY")
+    us10y, used_us10y = fetch_optional(US10Y_CANDIDATES, "US10Y")
+    vix, used_vix = fetch_optional(VIX_CANDIDATES, "VIX")
 
     # ATR on XAU
     xau2 = xau.copy()
@@ -201,35 +207,32 @@ def main():
 
     feats = make_features(
         xau2["Close"],
-        dxy_close,
-        us10y["Close"],
-        vix["Close"],
+        dxy["Close"] if dxy is not None else None,
+        us10y["Close"] if us10y is not None else None,
+        vix["Close"] if vix is not None else None,
     )
-    feats = feats.join(xau2["ATR"].rename("atr"), how="left").dropna()
 
-    # label: tomorrow up?
+    feats = feats.join(xau2["ATR"].rename("atr"), how="left").dropna()
     feats["y"] = (feats["xau"].shift(-1) > feats["xau"]).astype(int)
     feats = feats.dropna()
 
-    # Feature set (DXY varsa ekle)
-    feature_cols = [
-        "x_ret1","x_ret3","x_ret5",
-        "us10y_chg1","us10y_chg5",
-        "vix_ret1","vix_ret5",
-        "trend_up",
-    ]
-    if dxy is not None and "dxy_ret1" in feats.columns and "dxy_ret5" in feats.columns:
-        # x_ret* sonrasına koy
-        feature_cols.insert(3, "dxy_ret1")
-        feature_cols.insert(4, "dxy_ret5")
+    # Build feature list dynamically
+    feature_cols = ["x_ret1", "x_ret3", "x_ret5"]
+    if "dxy_ret1" in feats.columns and "dxy_ret5" in feats.columns:
+        feature_cols += ["dxy_ret1", "dxy_ret5"]
+    if "us10y_chg1" in feats.columns and "us10y_chg5" in feats.columns:
+        feature_cols += ["us10y_chg1", "us10y_chg5"]
+    if "vix_ret1" in feats.columns and "vix_ret5" in feats.columns:
+        feature_cols += ["vix_ret1", "vix_ret5"]
+    feature_cols += ["trend_up"]
 
     if len(feats) < TRAIN_DAYS + 10:
         raise RuntimeError(f"Not enough aligned rows: {len(feats)} need~{TRAIN_DAYS}")
 
     X = feats[feature_cols]
     y = feats["y"]
-    last_day = feats.index[-1]
 
+    last_day = feats.index[-1]
     X_train = X.iloc[-TRAIN_DAYS-1:-1]
     y_train = y.iloc[-TRAIN_DAYS-1:-1]
     X_last = X.loc[[last_day]]
@@ -245,7 +248,6 @@ def main():
     in_uptrend = int(feats.loc[last_day, "trend_up"]) == 1
     trend_txt = "UP" if in_uptrend else "DOWN"
 
-    # strict signal rules (az ama kaliteli)
     side = "NO-TRADE"
     if p_up > TH_LONG and in_uptrend:
         side = "LONG"
@@ -256,10 +258,15 @@ def main():
     atr = float(feats.loc[last_day, "atr"])
     stop_dist = STOP_ATR_MULT * atr
 
-    dxy_info = f"DXY source: {used_dxy}\n" if used_dxy else "DXY source: NONE\n"
+    src = (
+        f"Sources:\n"
+        f"DXY: {used_dxy or 'NONE'}\n"
+        f"US10Y: {used_us10y or 'NONE'}\n"
+        f"VIX: {used_vix or 'NONE'}\n"
+    )
 
     header = f"GOLD AI SIGNAL (XAUUSD)\nDate: {last_day.date()}\n"
-    info = dxy_info + f"P(up): {p_up:.4f}\nTrend(>MA50): {trend_txt}\n"
+    info = src + f"P(up): {p_up:.4f}\nTrend(>MA50): {trend_txt}\n"
 
     if side == "NO-TRADE":
         msg = header + "\n" + info + "\nSignal: NO-TRADE"
@@ -268,7 +275,6 @@ def main():
             send_telegram(msg)
         return
 
-    # SL/TP
     if side == "LONG":
         sl = entry - stop_dist
         tp = entry + RR * stop_dist
@@ -276,7 +282,6 @@ def main():
         sl = entry + stop_dist
         tp = entry - RR * stop_dist
 
-    # position size
     lot_raw = lot_from_risk(stop_dist, RISK_USD)
     lot = round_down(lot_raw, LOT_STEP)
 
@@ -311,7 +316,7 @@ if __name__ == "__main__":
     try:
         main()
     except Exception as e:
-        # GitHub logları boş kalabiliyor -> hatayı Telegram'a da yolla
+        # Hata olursa Telegram'a da yolla (GitHub logları boş kalabiliyor)
         err_type = type(e).__name__
         err_msg = str(e)
         if len(err_msg) > 800:
