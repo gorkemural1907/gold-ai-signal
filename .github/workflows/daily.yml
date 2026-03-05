@@ -1,6 +1,9 @@
 name: Gold AI Signal
 
 on:
+  schedule:
+    # Hafta içi her gün 22:00 UTC (Türkiye saati genelde UTC+3 => 01:00)
+    - cron: "0 22 * * 1-5"
   workflow_dispatch:
 
 jobs:
@@ -20,21 +23,9 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # Çalıştırmayı HER ZAMAN dosyaya yazdır
-      - - name: Run bot
-  env:
-    TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
-    TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-  run: |
-    python -u signal_bot.py
-          echo "EXIT_CODE=$?" >> runlog.txt
-          echo "---- LAST 120 LINES ----"
-          tail -n 120 runlog.txt || true
-
-      # Log dosyasını artifact olarak yükle (her zaman)
-      - name: Upload log artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: runlog
-          path: runlog.txt
-          if-no-files-found: error
+      - name: Run bot
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python -u signal_bot.py
