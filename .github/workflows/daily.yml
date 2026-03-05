@@ -1,13 +1,12 @@
 name: Gold AI Signal
 
 on:
-  schedule:
-    - cron: "0 22 * * 1-5"
   workflow_dispatch:
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -19,32 +18,8 @@ jobs:
 
       - name: Install packages
         run: |
-          set -euxo pipefail
-          python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # Çalıştırmayı log dosyasına yazdırıyoruz (UI boş kalmasın diye)
-      - name: Run bot (capture log)
-        id: runbot
-        continue-on-error: true
+      - name: Run bot
         run: |
-          set +e
-          python -u signal_bot.py > runlog.txt 2>&1
-          echo "exit_code=$?" >> $GITHUB_OUTPUT
-          echo "===== LAST 80 LINES OF LOG ====="
-          tail -n 80 runlog.txt || true
-
-      # Log dosyasını indirilebilir artifact yap
-      - name: Upload run log artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: runlog
-          path: runlog.txt
-          if-no-files-found: error
-
-      # Eğer script hata verdiyse job'u kırmızı yap
-      - name: Fail if bot failed
-        if: ${{ steps.runbot.outputs.exit_code != '0' }}
-        run: |
-          echo "Bot failed with exit code ${{ steps.runbot.outputs.exit_code }}"
-          exit 1
+          python signal_bot.py
