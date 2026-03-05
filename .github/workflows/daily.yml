@@ -21,10 +21,12 @@ jobs:
           pip install -r requirements.txt
 
       # Çalıştırmayı HER ZAMAN dosyaya yazdır
-      - name: Run bot (write log file)
-        run: |
-          set +e
-          python -u signal_bot.py > runlog.txt 2>&1
+      - - name: Run bot
+  env:
+    TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+    TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+  run: |
+    python -u signal_bot.py
           echo "EXIT_CODE=$?" >> runlog.txt
           echo "---- LAST 120 LINES ----"
           tail -n 120 runlog.txt || true
