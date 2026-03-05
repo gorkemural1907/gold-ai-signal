@@ -78,10 +78,6 @@ def fetch_ohlc_stooq(symbol: str, retries: int = 5, sleep_s: float = 2.0) -> pd.
     raise RuntimeError(f"Stooq fetch failed for {symbol}: {type(last_err).__name__}: {str(last_err)[:200]}")
 
 def fetch_optional(symbols: list[str], label: str) -> tuple[pd.DataFrame | None, str | None]:
-    """
-    Try symbols in order. Return (df, used_symbol).
-    If all fail -> (None, None).
-    """
     for sym in symbols:
         try:
             df = fetch_ohlc_stooq(sym)
@@ -89,7 +85,6 @@ def fetch_optional(symbols: list[str], label: str) -> tuple[pd.DataFrame | None,
         except Exception:
             pass
 
-    # optional fail
     send_telegram(f"⚠️ {label} verisi alınamadı ({'/'.join(symbols)}). Bugün {label} features devre dışı.")
     return None, None
 
@@ -109,9 +104,8 @@ TRAIN_DAYS = 252 * 5
 TH_LONG = 0.65
 TH_SHORT = 0.35
 
-# En kaliteli filtreler:
-REQUIRE_VIX_FOR_TRADE = True   # VIX yoksa TRADE yok
-MIN_EDGE = 0.17                # p_up - 0.5 en az 0.17 olsun (noise azaltır)
+REQUIRE_VIX_FOR_TRADE = True
+MIN_EDGE = 0.17
 
 ATR_LEN = 14
 STOP_ATR_MULT = 2.0
@@ -124,6 +118,11 @@ RISK_USD = ACCOUNT_USD * (RISK_PCT / 100.0)
 LOT_OZ = 100.0
 MIN_LOT = 0.01
 LOT_STEP = 0.01
+
+# Spread (10 bps)
+SPREAD_BPS = 10
+SPREAD = SPREAD_BPS / 10000.0         # 10 bps = 0.001
+HALF_SPREAD = SPREAD / 2.0            # 0.0005
 
 # ============================================================
 # Indicators
@@ -193,15 +192,11 @@ def make_features(xau_close: pd.Series,
 def main():
     print("Downloading data...")
 
-    # Required
     xau = fetch_ohlc_stooq(XAU)
-
-    # Optional with fallback
     dxy, used_dxy = fetch_optional(DXY_CANDIDATES, "DXY")
     us10y, used_us10y = fetch_optional(US10Y_CANDIDATES, "US10Y")
     vix, used_vix = fetch_optional(VIX_CANDIDATES, "VIX")
 
-    # ATR on XAU
     xau2 = xau.copy()
     xau2["ATR"] = compute_atr(xau2, ATR_LEN)
 
@@ -216,7 +211,6 @@ def main():
     feats["y"] = (feats["xau"].shift(-1) > feats["xau"]).astype(int)
     feats = feats.dropna()
 
-    # Dynamic feature list
     feature_cols = ["x_ret1", "x_ret3", "x_ret5"]
     if "dxy_ret1" in feats.columns and "dxy_ret5" in feats.columns:
         feature_cols += ["dxy_ret1", "dxy_ret5"]
@@ -251,7 +245,6 @@ def main():
     vix_available = used_vix is not None
     reason = ""
 
-    # Strict rules (EN KALİTELİ)
     side = "NO-TRADE"
     if REQUIRE_VIX_FOR_TRADE and not vix_available:
         reason = "VIX missing -> quality filter"
@@ -261,9 +254,17 @@ def main():
         elif (p_up < TH_SHORT) and ((0.5 - p_up) >= MIN_EDGE) and (not in_uptrend):
             side = "SHORT"
 
-    entry = float(feats.loc[last_day, "xau"])
+    mid = float(feats.loc[last_day, "xau"])   # Close(mid)
     atr = float(feats.loc[last_day, "atr"])
     stop_dist = STOP_ATR_MULT * atr
+
+    # Spread-adjusted executable entry
+    if side == "LONG":
+        entry_exec = mid * (1.0 + HALF_SPREAD)  # ask
+    elif side == "SHORT":
+        entry_exec = mid * (1.0 - HALF_SPREAD)  # bid
+    else:
+        entry_exec = mid
 
     src = (
         f"Sources:\n"
@@ -273,7 +274,11 @@ def main():
     )
 
     header = f"GOLD AI SIGNAL (XAUUSD)\nDate: {last_day.date()}\n"
-    info = src + f"P(up): {p_up:.4f}\nTrend(>MA50): {trend_txt}\n"
+    info = (
+        src
+        + f"P(up): {p_up:.4f}\nTrend(>MA50): {trend_txt}\n"
+        + f"Spread: {SPREAD_BPS} bps (±{SPREAD_BPS/2:.1f} bps)\n"
+    )
     if reason:
         info += f"Filter: {reason}\n"
 
@@ -284,15 +289,15 @@ def main():
             send_telegram(msg)
         return
 
-    # SL/TP
+    # SL/TP (spread-adjusted entry basis)
     if side == "LONG":
-        sl = entry - stop_dist
-        tp = entry + RR * stop_dist
+        sl = entry_exec - stop_dist
+        tp = entry_exec + RR * stop_dist
     else:
-        sl = entry + stop_dist
-        tp = entry - RR * stop_dist
+        sl = entry_exec + stop_dist
+        tp = entry_exec - RR * stop_dist
 
-    # position size
+    # position size based on stop distance from executable entry
     lot_raw = lot_from_risk(stop_dist, RISK_USD)
     lot = round_down(lot_raw, LOT_STEP)
 
@@ -306,7 +311,8 @@ def main():
         header + "\n"
         + info + "\n"
         + f"Signal: {side}\n\n"
-        + f"Entry (ref=Close): {entry:.2f}\n"
+        + f"Mid (Close): {mid:.2f}\n"
+        + f"Entry (spread adj): {entry_exec:.2f}\n"
         + f"Stop Loss: {sl:.2f}\n"
         + f"Take Profit: {tp:.2f}\n"
         + f"ATR({ATR_LEN}): {atr:.2f}\n"
@@ -327,7 +333,6 @@ if __name__ == "__main__":
     try:
         main()
     except Exception as e:
-        # Hata olursa Telegram'a da yolla (GitHub logları boş kalabiliyor)
         err_type = type(e).__name__
         err_msg = str(e)
         if len(err_msg) > 800:
