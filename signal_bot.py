@@ -1,122 +1,222 @@
+import os
+import math
+import requests
 import pandas as pd
 import numpy as np
-import requests
-import os
+
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import Pipeline
 
-URL = "https://stooq.com/q/d/l/?s=xauusd&i=d"
+# ---------- Stooq symbols ----------
+def stooq_csv(symbol: str) -> str:
+    return f"https://stooq.com/q/d/l/?s={symbol}&i=d"
 
-TH_LONG = 0.65
+XAU = "xauusd"
+DXY = "dx.f"
+US10Y = "10yusy.b"
+VIX = "vi.f"
+
+# ---------- Trading config ----------
+TRAIN_DAYS = 252 * 5          # 5 yıl train (daha stabil)
+TH_LONG = 0.65                # az ama kaliteli
 TH_SHORT = 0.35
 
 ATR_LEN = 14
-STOP_MULT = 2
+STOP_ATR_MULT = 2.0
+RR = 2.0
 
-ACCOUNT = 1000
-RISK = 10
+ACCOUNT_USD = 1000.0
+RISK_PCT = 1.0
+RISK_USD = ACCOUNT_USD * (RISK_PCT / 100.0)
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+LOT_OZ = 100.0                # 1.00 lot = 100 oz varsayımı
+MIN_LOT = 0.01
+LOT_STEP = 0.01
 
+# ---------- Telegram ----------
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-def send_telegram(msg):
+# Debug amaçlı: sinyal yoksa da mesaj atmak istersen true yap.
+SEND_NO_TRADE = False
+
+def send_telegram(text: str) -> None:
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        print("Telegram secrets missing (TELEGRAM_TOKEN / TELEGRAM_CHAT_ID). Printing only:\n")
+        print(text)
+        return
 
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    r = requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text}, timeout=20)
 
-    requests.post(url,json={
-        "chat_id": CHAT_ID,
-        "text": msg
-    })
+    # Hata varsa workflow kırmızıya dönsün diye raise ediyoruz
+    if r.status_code != 200:
+        raise RuntimeError(f"Telegram send failed: {r.status_code} {r.text}")
 
+def compute_atr(ohlc: pd.DataFrame, n: int) -> pd.Series:
+    prev_close = ohlc["Close"].shift(1)
+    tr = pd.concat(
+        [
+            (ohlc["High"] - ohlc["Low"]).rename("hl"),
+            (ohlc["High"] - prev_close).abs().rename("hc"),
+            (ohlc["Low"] - prev_close).abs().rename("lc"),
+        ],
+        axis=1,
+    ).max(axis=1)
+    return tr.rolling(n).mean()
 
-df = pd.read_csv(URL)
+def round_down(x: float, step: float) -> float:
+    return math.floor(x / step) * step if step > 0 else x
 
-df["Date"] = pd.to_datetime(df["Date"])
-df = df.sort_values("Date").set_index("Date")
+def lot_from_risk(stop_distance_usd: float, risk_usd: float) -> float:
+    # 1$ fiyat hareketi => 1 lot PnL ~ 100$ (100 oz)
+    if stop_distance_usd <= 0:
+        return 0.0
+    return risk_usd / (stop_distance_usd * LOT_OZ)
 
-prev_close = df["Close"].shift(1)
+def fetch_ohlc(symbol: str) -> pd.DataFrame:
+    df = pd.read_csv(stooq_csv(symbol))
+    df["Date"] = pd.to_datetime(df["Date"])
+    df = df.sort_values("Date").set_index("Date")
+    return df[["Open", "High", "Low", "Close"]]
 
-tr = pd.concat([
-(df["High"] - df["Low"]),
-(df["High"] - prev_close).abs(),
-(df["Low"] - prev_close).abs()
-], axis=1).max(axis=1)
+def make_features(xau: pd.DataFrame, dxy: pd.DataFrame, us10y: pd.DataFrame, vix: pd.DataFrame) -> pd.DataFrame:
+    # Close serileri
+    x = xau["Close"].rename("xau")
+    d = dxy["Close"].rename("dxy")
+    y = us10y["Close"].rename("us10y")
+    v = vix["Close"].rename("vix")
 
-df["ATR"] = tr.rolling(ATR_LEN).mean()
+    df = pd.concat([x, d, y, v], axis=1).dropna()
 
-close = df["Close"]
+    # Returns
+    df["x_ret1"] = np.log(df["xau"]).diff()
+    df["x_ret3"] = np.log(df["xau"]).diff(3)
+    df["x_ret5"] = np.log(df["xau"]).diff(5)
 
-ret = np.log(close).diff()
+    df["dxy_ret1"] = np.log(df["dxy"]).diff()
+    df["dxy_ret5"] = np.log(df["dxy"]).diff(5)
 
-feat = pd.DataFrame(index=df.index)
+    df["us10y_chg1"] = df["us10y"].diff()
+    df["us10y_chg5"] = df["us10y"].diff(5)
 
-feat["ret1"] = ret
-feat["mom5"] = close / close.rolling(5).mean()
-feat["mom10"] = close / close.rolling(10).mean()
+    df["vix_ret1"] = np.log(df["vix"]).diff()
+    df["vix_ret5"] = np.log(df["vix"]).diff(5)
 
-y = (close.shift(-1) > close).astype(int)
+    # Trend filter (MA50)
+    df["ma50"] = df["xau"].rolling(50).mean()
+    df["trend"] = (df["xau"] > df["ma50"]).astype(int)  # 1=uptrend, 0=downtrend
 
-data = feat.join(y.rename("y")).join(df[["Close","ATR"]]).dropna()
+    return df
 
-X = data.drop(columns=["y","Close","ATR"])
-y = data["y"]
+def main():
+    print("Downloading data...")
+    xau = fetch_ohlc(XAU)
+    dxy = fetch_ohlc(DXY)
+    us10y = fetch_ohlc(US10Y)
+    vix = fetch_ohlc(VIX)
 
-model = Pipeline([
-("scaler", StandardScaler()),
-("clf", LogisticRegression(max_iter=2000))
-])
+    # ATR only on XAU
+    xau_atr = xau.copy()
+    xau_atr["ATR"] = compute_atr(xau_atr, ATR_LEN)
 
-model.fit(X,y)
+    feats = make_features(xau_atr, dxy, us10y, vix)
+    # Align ATR back
+    feats = feats.join(xau_atr["ATR"].rename("atr"), how="left").dropna()
 
-last = X.index[-1]
+    # Label: tomorrow up?
+    feats["y"] = (feats["xau"].shift(-1) > feats["xau"]).astype(int)
+    feats = feats.dropna()
 
-prob = model.predict_proba(X.loc[[last]])[:,1][0]
+    feature_cols = [
+        "x_ret1","x_ret3","x_ret5",
+        "dxy_ret1","dxy_ret5",
+        "us10y_chg1","us10y_chg5",
+        "vix_ret1","vix_ret5",
+        "trend",
+    ]
 
-price = df.loc[last,"Close"]
-atr = df.loc[last,"ATR"]
+    if len(feats) < TRAIN_DAYS + 10:
+        raise RuntimeError(f"Not enough rows: {len(feats)} (need ~{TRAIN_DAYS})")
 
-signal = "NO TRADE"
+    # Train on last TRAIN_DAYS ending at yesterday of last row
+    X = feats[feature_cols]
+    y = feats["y"]
 
-if prob > TH_LONG:
-    signal = "LONG"
+    # We want signal for last available day
+    last_day = feats.index[-1]
+    X_train = X.iloc[-TRAIN_DAYS-1:-1]
+    y_train = y.iloc[-TRAIN_DAYS-1:-1]
+    X_last = X.loc[[last_day]]
 
-if prob < TH_SHORT:
-    signal = "SHORT"
+    model = Pipeline([
+        ("scaler", StandardScaler()),
+        ("clf", LogisticRegression(max_iter=2000))
+    ])
+    model.fit(X_train, y_train)
 
-if signal == "NO TRADE":
-    exit()
+    p_up = float(model.predict_proba(X_last)[:, 1][0])
 
-stop = atr * STOP_MULT
+    # Decide signal with trend filter:
+    # Uptrend => only LONG allowed; Downtrend => only SHORT allowed
+    in_uptrend = int(feats.loc[last_day, "trend"]) == 1
 
-if signal == "LONG":
+    side = "NO-TRADE"
+    if p_up > TH_LONG and in_uptrend:
+        side = "LONG"
+    elif p_up < TH_SHORT and (not in_uptrend):
+        side = "SHORT"
 
-    sl = price - stop
-    tp = price + stop*2
+    entry = float(feats.loc[last_day, "xau"])
+    atr = float(feats.loc[last_day, "atr"])
+    stop_dist = STOP_ATR_MULT * atr
 
-else:
+    # Compose message (even if no-trade, log it)
+    header = f"GOLD AI SIGNAL (XAUUSD)\nSignal date: {last_day.date()}\n"
+    info = f"P(up): {p_up:.4f}\nTrend(>MA50): {'UP' if in_uptrend else 'DOWN'}\n"
 
-    sl = price + stop
-    tp = price - stop*2
+    if side == "NO-TRADE":
+        msg = header + "\n" + info + "\nSignal: NO-TRADE"
+        print(msg)
+        if SEND_NO_TRADE:
+            send_telegram(msg)
+        return
 
-lot = RISK / (stop*100)
+    if side == "LONG":
+        sl = entry - stop_dist
+        tp = entry + RR * stop_dist
+    else:
+        sl = entry + stop_dist
+        tp = entry - RR * stop_dist
 
-msg = f"""
-GOLD AI SIGNAL
+    lot_raw = lot_from_risk(stop_dist, RISK_USD)
+    lot = round_down(lot_raw, LOT_STEP)
 
-Signal: {signal}
+    min_lot_risk = MIN_LOT * stop_dist * LOT_OZ
+    lot_note = ""
+    if lot < MIN_LOT:
+        lot_note = f"⚠️ Suggested lot < min lot. Min lot {MIN_LOT:.2f} risk≈${min_lot_risk:.2f} (target ${RISK_USD:.2f})."
+        # İstersen burada “NO-TRADE” yapabiliriz. Şimdilik uyarı verip min lotu yazıyoruz:
+        lot = MIN_LOT
 
-Probability: {round(prob,3)}
+    msg = (
+        header + "\n"
+        + info + "\n"
+        + f"Signal: {side}\n\n"
+        + f"Entry (ref=Close): {entry:.2f}\n"
+        + f"ATR({ATR_LEN}): {atr:.2f}\n"
+        + f"Stop Loss: {sl:.2f}  ({STOP_ATR_MULT:.1f} ATR)\n"
+        + f"Take Profit: {tp:.2f}  ({RR:.1f}R)\n\n"
+        + f"Account: ${ACCOUNT_USD:.0f}\n"
+        + f"Risk: ${RISK_USD:.2f} ({RISK_PCT:.1f}%)\n"
+        + f"Suggested lot: {lot:.2f}\n"
+    )
+    if lot_note:
+        msg += f"\n{lot_note}\n"
 
-Entry: {round(price,2)}
-Stop Loss: {round(sl,2)}
-Take Profit: {round(tp,2)}
+    print(msg)
+    send_telegram(msg)
 
-Lot Size: {round(lot,3)}
-Risk: ${RISK}
-"""
-
-send_telegram(msg)
-
-print(msg)
+if __name__ == "__main__":
+    main()
