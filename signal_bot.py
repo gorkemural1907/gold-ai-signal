@@ -20,6 +20,7 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
 def send_telegram(text: str) -> None:
+    # Token/URL/exception text basma (GitHub mask issues)
     if DEBUG_NO_TELEGRAM:
         print(text)
         return
@@ -60,7 +61,6 @@ def fetch_ohlc_stooq(symbol: str, retries: int = 5, sleep_s: float = 2.0) -> pd.
                 raise RuntimeError(f"HTTP {resp.status_code}")
 
             txt = resp.text or ""
-            # Stooq bazen "Exceeded the daily hits limit" gibi mesaj döndürebiliyor
             if "Exceeded the daily hits limit" in txt:
                 raise RuntimeError("Stooq quota exceeded")
             if len(txt) < 50:
@@ -106,9 +106,9 @@ DXY_CANDIDATES    = ["dx.f", "usd_i", "usdidx"]
 VIX_CANDIDATES    = ["vi.f", "vix"]
 US10Y_CANDIDATES  = ["10yusy.b", "us10y"]
 
-# Yeni ekler:
 SPX_CANDIDATES    = ["^spx"]       # S&P 500
-TIPS_CANDIDATES   = ["tip.us"]     # iShares TIPS ETF
+TIPS_CANDIDATES   = ["tip.us"]     # TIPS ETF
+IEF_CANDIDATES    = ["ief.us"]     # 7-10Y Treasury ETF (nominal proxy)
 
 # ============================================================
 # Strategy / risk config (EN KALİTELİ SWING)
@@ -119,6 +119,11 @@ TH_SHORT = 0.35
 
 REQUIRE_VIX_FOR_TRADE = True
 MIN_EDGE = 0.17
+
+# Real-rate proxy filtre (TIP/IEF)
+REQUIRE_REAL_FACTOR_FOR_TRADE = True  # en kaliteli: True kalsın
+REAL_FACTOR_LOOKBACK = 5              # 5g değişim
+# LONG için real_f_chg5 > 0, SHORT için < 0
 
 ATR_LEN = 14
 STOP_ATR_MULT = 2.0
@@ -170,6 +175,7 @@ def make_features(
     vix_close: pd.Series | None,
     spx_close: pd.Series | None,
     tips_close: pd.Series | None,
+    ief_close: pd.Series | None,
 ) -> pd.DataFrame:
 
     series = [xau_close.rename("xau")]
@@ -183,6 +189,8 @@ def make_features(
         series.append(spx_close.rename("spx"))
     if tips_close is not None:
         series.append(tips_close.rename("tips"))
+    if ief_close is not None:
+        series.append(ief_close.rename("ief"))
 
     df = pd.concat(series, axis=1).dropna()
 
@@ -191,30 +199,36 @@ def make_features(
     df["x_ret3"] = np.log(df["xau"]).diff(3)
     df["x_ret5"] = np.log(df["xau"]).diff(5)
 
-    # DXY (optional)
+    # DXY
     if "dxy" in df.columns:
         df["dxy_ret1"] = np.log(df["dxy"]).diff()
         df["dxy_ret5"] = np.log(df["dxy"]).diff(5)
 
-    # US10Y changes (optional)
+    # US10Y (level change)
     if "us10y" in df.columns:
         df["us10y_chg1"] = df["us10y"].diff()
         df["us10y_chg5"] = df["us10y"].diff(5)
 
-    # VIX (optional)
+    # VIX
     if "vix" in df.columns:
         df["vix_ret1"] = np.log(df["vix"]).diff()
         df["vix_ret5"] = np.log(df["vix"]).diff(5)
 
-    # SPX risk-on/off (optional)
+    # SPX
     if "spx" in df.columns:
         df["spx_ret1"] = np.log(df["spx"]).diff()
         df["spx_ret5"] = np.log(df["spx"]).diff(5)
 
-    # TIPS (real-rate/inflation proxy) (optional)
+    # TIPS (standalone)
     if "tips" in df.columns:
         df["tips_ret1"] = np.log(df["tips"]).diff()
         df["tips_ret5"] = np.log(df["tips"]).diff(5)
+
+    # REAL RATE PROXY: TIP/IEF
+    if "tips" in df.columns and "ief" in df.columns:
+        # ratio level + change
+        df["real_factor"] = np.log(df["tips"] / df["ief"])
+        df["real_f_chg5"] = df["real_factor"].diff(REAL_FACTOR_LOOKBACK)
 
     # Trend filter
     df["ma50"] = df["xau"].rolling(50).mean()
@@ -231,14 +245,14 @@ def main():
     # Required
     xau = fetch_ohlc_stooq(XAU)
 
-    # Optional macro/risk sources (fallback)
+    # Optional macro/risk sources
     dxy, used_dxy = fetch_optional(DXY_CANDIDATES, "DXY")
     us10y, used_us10y = fetch_optional(US10Y_CANDIDATES, "US10Y")
     vix, used_vix = fetch_optional(VIX_CANDIDATES, "VIX")
 
-    # New optional: SPX + TIPS
     spx, used_spx = fetch_optional(SPX_CANDIDATES, "SPX")
     tips, used_tips = fetch_optional(TIPS_CANDIDATES, "TIPS")
+    ief, used_ief = fetch_optional(IEF_CANDIDATES, "IEF")
 
     # ATR on XAU
     xau2 = xau.copy()
@@ -251,6 +265,7 @@ def main():
         vix["Close"] if vix is not None else None,
         spx["Close"] if spx is not None else None,
         tips["Close"] if tips is not None else None,
+        ief["Close"] if ief is not None else None,
     )
 
     feats = feats.join(xau2["ATR"].rename("atr"), how="left").dropna()
@@ -270,6 +285,8 @@ def main():
         feature_cols += ["spx_ret1", "spx_ret5"]
     if "tips_ret1" in feats.columns and "tips_ret5" in feats.columns:
         feature_cols += ["tips_ret1", "tips_ret5"]
+    if "real_f_chg5" in feats.columns:
+        feature_cols += ["real_f_chg5"]
 
     feature_cols += ["trend_up"]
 
@@ -295,18 +312,38 @@ def main():
     in_uptrend = int(feats.loc[last_day, "trend_up"]) == 1
     trend_txt = "UP" if in_uptrend else "DOWN"
 
+    # Real factor value (if available)
+    real_available = "real_f_chg5" in feats.columns
+    real_chg5 = float(feats.loc[last_day, "real_f_chg5"]) if real_available else float("nan")
+
     vix_available = used_vix is not None
     reason = ""
 
     # Strict (EN KALİTELİ)
     side = "NO-TRADE"
+
+    # 1) VIX quality gate
     if REQUIRE_VIX_FOR_TRADE and not vix_available:
         reason = "VIX missing -> quality filter"
     else:
+        # 2) AI + trend + edge
         if (p_up > TH_LONG) and ((p_up - 0.5) >= MIN_EDGE) and in_uptrend:
             side = "LONG"
         elif (p_up < TH_SHORT) and ((0.5 - p_up) >= MIN_EDGE) and (not in_uptrend):
             side = "SHORT"
+
+        # 3) Real-rate proxy gate (TIP/IEF)
+        if side in ("LONG", "SHORT") and REQUIRE_REAL_FACTOR_FOR_TRADE:
+            if not real_available:
+                side = "NO-TRADE"
+                reason = "Real factor missing (TIP/IEF) -> quality filter"
+            else:
+                if side == "LONG" and not (real_chg5 > 0):
+                    side = "NO-TRADE"
+                    reason = "Real factor down -> block LONG"
+                elif side == "SHORT" and not (real_chg5 < 0):
+                    side = "NO-TRADE"
+                    reason = "Real factor up -> block SHORT"
 
     mid = float(feats.loc[last_day, "xau"])
     atr = float(feats.loc[last_day, "atr"])
@@ -327,6 +364,7 @@ def main():
         f"VIX: {used_vix or 'NONE'}\n"
         f"SPX: {used_spx or 'NONE'}\n"
         f"TIPS: {used_tips or 'NONE'}\n"
+        f"IEF: {used_ief or 'NONE'}\n"
     )
 
     header = f"GOLD AI SIGNAL (XAUUSD)\nDate: {last_day.date()}\n"
@@ -335,6 +373,11 @@ def main():
         + f"P(up): {p_up:.4f}\nTrend(>MA50): {trend_txt}\n"
         + f"Spread: {SPREAD_BPS} bps (±{SPREAD_BPS/2:.1f} bps)\n"
     )
+    if real_available:
+        info += f"RealFactor chg{REAL_FACTOR_LOOKBACK}: {real_chg5:+.4f}\n"
+    else:
+        info += f"RealFactor chg{REAL_FACTOR_LOOKBACK}: N/A\n"
+
     if reason:
         info += f"Filter: {reason}\n"
 
