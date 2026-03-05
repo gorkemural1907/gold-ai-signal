@@ -20,11 +20,9 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
 def send_telegram(text: str) -> None:
-    # Token/URL/exception text basma (GitHub mask issues)
     if DEBUG_NO_TELEGRAM:
         print(text)
         return
-
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         print(text)
         return
@@ -38,8 +36,15 @@ def send_telegram(text: str) -> None:
         raise RuntimeError("Telegram send failed (network/api).")
 
 # ============================================================
-# Stooq
+# Stooq download (rate-limit friendly)
 # ============================================================
+SESSION = requests.Session()
+SESSION.headers.update({
+    "User-Agent": "Mozilla/5.0 (compatible; GoldAISignal/1.0; +https://github.com/)"
+})
+
+FETCH_PAUSE_S = 0.6  # Stooq quota riskini azaltır
+
 def stooq_url(symbol: str) -> str:
     return f"https://stooq.com/q/d/l/?s={symbol}&i=d"
 
@@ -49,12 +54,16 @@ def fetch_ohlc_stooq(symbol: str, retries: int = 5, sleep_s: float = 2.0) -> pd.
 
     for _ in range(retries):
         try:
-            resp = requests.get(url, timeout=25)
+            time.sleep(FETCH_PAUSE_S)
+            resp = SESSION.get(url, timeout=25)
             if resp.status_code != 200:
                 raise RuntimeError(f"HTTP {resp.status_code}")
 
-            txt = resp.text
-            if not txt or len(txt) < 50:
+            txt = resp.text or ""
+            # Stooq bazen "Exceeded the daily hits limit" gibi mesaj döndürebiliyor
+            if "Exceeded the daily hits limit" in txt:
+                raise RuntimeError("Stooq quota exceeded")
+            if len(txt) < 50:
                 raise RuntimeError("Empty/short CSV")
 
             df = pd.read_csv(StringIO(txt))
@@ -93,12 +102,16 @@ def fetch_optional(symbols: list[str], label: str) -> tuple[pd.DataFrame | None,
 # ============================================================
 XAU = "xauusd"  # required
 
-DXY_CANDIDATES   = ["dx.f", "usd_i", "usdidx"]
-VIX_CANDIDATES   = ["vi.f", "vix"]
-US10Y_CANDIDATES = ["10yusy.b", "us10y"]
+DXY_CANDIDATES    = ["dx.f", "usd_i", "usdidx"]
+VIX_CANDIDATES    = ["vi.f", "vix"]
+US10Y_CANDIDATES  = ["10yusy.b", "us10y"]
+
+# Yeni ekler:
+SPX_CANDIDATES    = ["^spx"]       # S&P 500
+TIPS_CANDIDATES   = ["tip.us"]     # iShares TIPS ETF
 
 # ============================================================
-# Strategy / risk config (EN KALİTELİ MOD)
+# Strategy / risk config (EN KALİTELİ SWING)
 # ============================================================
 TRAIN_DAYS = 252 * 5
 TH_LONG = 0.65
@@ -121,8 +134,8 @@ LOT_STEP = 0.01
 
 # Spread (10 bps)
 SPREAD_BPS = 10
-SPREAD = SPREAD_BPS / 10000.0         # 10 bps = 0.001
-HALF_SPREAD = SPREAD / 2.0            # 0.0005
+SPREAD = SPREAD_BPS / 10000.0
+HALF_SPREAD = SPREAD / 2.0
 
 # ============================================================
 # Indicators
@@ -150,10 +163,14 @@ def lot_from_risk(stop_distance_usd: float, risk_usd: float) -> float:
 # ============================================================
 # Features
 # ============================================================
-def make_features(xau_close: pd.Series,
-                  dxy_close: pd.Series | None,
-                  us10y_close: pd.Series | None,
-                  vix_close: pd.Series | None) -> pd.DataFrame:
+def make_features(
+    xau_close: pd.Series,
+    dxy_close: pd.Series | None,
+    us10y_close: pd.Series | None,
+    vix_close: pd.Series | None,
+    spx_close: pd.Series | None,
+    tips_close: pd.Series | None,
+) -> pd.DataFrame:
 
     series = [xau_close.rename("xau")]
     if dxy_close is not None:
@@ -162,25 +179,44 @@ def make_features(xau_close: pd.Series,
         series.append(us10y_close.rename("us10y"))
     if vix_close is not None:
         series.append(vix_close.rename("vix"))
+    if spx_close is not None:
+        series.append(spx_close.rename("spx"))
+    if tips_close is not None:
+        series.append(tips_close.rename("tips"))
 
     df = pd.concat(series, axis=1).dropna()
 
+    # XAU returns
     df["x_ret1"] = np.log(df["xau"]).diff()
     df["x_ret3"] = np.log(df["xau"]).diff(3)
     df["x_ret5"] = np.log(df["xau"]).diff(5)
 
+    # DXY (optional)
     if "dxy" in df.columns:
         df["dxy_ret1"] = np.log(df["dxy"]).diff()
         df["dxy_ret5"] = np.log(df["dxy"]).diff(5)
 
+    # US10Y changes (optional)
     if "us10y" in df.columns:
         df["us10y_chg1"] = df["us10y"].diff()
         df["us10y_chg5"] = df["us10y"].diff(5)
 
+    # VIX (optional)
     if "vix" in df.columns:
         df["vix_ret1"] = np.log(df["vix"]).diff()
         df["vix_ret5"] = np.log(df["vix"]).diff(5)
 
+    # SPX risk-on/off (optional)
+    if "spx" in df.columns:
+        df["spx_ret1"] = np.log(df["spx"]).diff()
+        df["spx_ret5"] = np.log(df["spx"]).diff(5)
+
+    # TIPS (real-rate/inflation proxy) (optional)
+    if "tips" in df.columns:
+        df["tips_ret1"] = np.log(df["tips"]).diff()
+        df["tips_ret5"] = np.log(df["tips"]).diff(5)
+
+    # Trend filter
     df["ma50"] = df["xau"].rolling(50).mean()
     df["trend_up"] = (df["xau"] > df["ma50"]).astype(int)
 
@@ -192,11 +228,19 @@ def make_features(xau_close: pd.Series,
 def main():
     print("Downloading data...")
 
+    # Required
     xau = fetch_ohlc_stooq(XAU)
+
+    # Optional macro/risk sources (fallback)
     dxy, used_dxy = fetch_optional(DXY_CANDIDATES, "DXY")
     us10y, used_us10y = fetch_optional(US10Y_CANDIDATES, "US10Y")
     vix, used_vix = fetch_optional(VIX_CANDIDATES, "VIX")
 
+    # New optional: SPX + TIPS
+    spx, used_spx = fetch_optional(SPX_CANDIDATES, "SPX")
+    tips, used_tips = fetch_optional(TIPS_CANDIDATES, "TIPS")
+
+    # ATR on XAU
     xau2 = xau.copy()
     xau2["ATR"] = compute_atr(xau2, ATR_LEN)
 
@@ -205,19 +249,28 @@ def main():
         dxy["Close"] if dxy is not None else None,
         us10y["Close"] if us10y is not None else None,
         vix["Close"] if vix is not None else None,
+        spx["Close"] if spx is not None else None,
+        tips["Close"] if tips is not None else None,
     )
 
     feats = feats.join(xau2["ATR"].rename("atr"), how="left").dropna()
     feats["y"] = (feats["xau"].shift(-1) > feats["xau"]).astype(int)
     feats = feats.dropna()
 
+    # Dynamic feature list
     feature_cols = ["x_ret1", "x_ret3", "x_ret5"]
+
     if "dxy_ret1" in feats.columns and "dxy_ret5" in feats.columns:
         feature_cols += ["dxy_ret1", "dxy_ret5"]
     if "us10y_chg1" in feats.columns and "us10y_chg5" in feats.columns:
         feature_cols += ["us10y_chg1", "us10y_chg5"]
     if "vix_ret1" in feats.columns and "vix_ret5" in feats.columns:
         feature_cols += ["vix_ret1", "vix_ret5"]
+    if "spx_ret1" in feats.columns and "spx_ret5" in feats.columns:
+        feature_cols += ["spx_ret1", "spx_ret5"]
+    if "tips_ret1" in feats.columns and "tips_ret5" in feats.columns:
+        feature_cols += ["tips_ret1", "tips_ret5"]
+
     feature_cols += ["trend_up"]
 
     if len(feats) < TRAIN_DAYS + 10:
@@ -245,6 +298,7 @@ def main():
     vix_available = used_vix is not None
     reason = ""
 
+    # Strict (EN KALİTELİ)
     side = "NO-TRADE"
     if REQUIRE_VIX_FOR_TRADE and not vix_available:
         reason = "VIX missing -> quality filter"
@@ -254,7 +308,7 @@ def main():
         elif (p_up < TH_SHORT) and ((0.5 - p_up) >= MIN_EDGE) and (not in_uptrend):
             side = "SHORT"
 
-    mid = float(feats.loc[last_day, "xau"])   # Close(mid)
+    mid = float(feats.loc[last_day, "xau"])
     atr = float(feats.loc[last_day, "atr"])
     stop_dist = STOP_ATR_MULT * atr
 
@@ -271,6 +325,8 @@ def main():
         f"DXY: {used_dxy or 'NONE'}\n"
         f"US10Y: {used_us10y or 'NONE'}\n"
         f"VIX: {used_vix or 'NONE'}\n"
+        f"SPX: {used_spx or 'NONE'}\n"
+        f"TIPS: {used_tips or 'NONE'}\n"
     )
 
     header = f"GOLD AI SIGNAL (XAUUSD)\nDate: {last_day.date()}\n"
@@ -289,7 +345,7 @@ def main():
             send_telegram(msg)
         return
 
-    # SL/TP (spread-adjusted entry basis)
+    # SL/TP based on executable entry
     if side == "LONG":
         sl = entry_exec - stop_dist
         tp = entry_exec + RR * stop_dist
@@ -297,7 +353,7 @@ def main():
         sl = entry_exec + stop_dist
         tp = entry_exec - RR * stop_dist
 
-    # position size based on stop distance from executable entry
+    # position size
     lot_raw = lot_from_risk(stop_dist, RISK_USD)
     lot = round_down(lot_raw, LOT_STEP)
 
