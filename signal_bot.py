@@ -3,10 +3,16 @@ import math
 import requests
 import pandas as pd
 import numpy as np
-
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import Pipeline
+
+# ============================================================
+# DEBUG
+# True  => Telegram gönderme kapalı (Actions loguna basar)
+# False => Telegram gönderir
+# ============================================================
+DEBUG_NO_TELEGRAM = True
 
 # ---------- Stooq symbols ----------
 def stooq_csv(symbol: str) -> str:
@@ -30,30 +36,43 @@ ACCOUNT_USD = 1000.0
 RISK_PCT = 1.0
 RISK_USD = ACCOUNT_USD * (RISK_PCT / 100.0)
 
-LOT_OZ = 100.0                # 1.00 lot = 100 oz varsayımı
+# XAUUSD lot varsayımı: 1.00 lot = 100 oz (çoğu FX broker)
+LOT_OZ = 100.0
 MIN_LOT = 0.01
 LOT_STEP = 0.01
 
-# ---------- Telegram ----------
+# ---------- Telegram secrets ----------
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-# Debug amaçlı: sinyal yoksa da mesaj atmak istersen true yap.
-SEND_NO_TRADE = False
-
+# ============================================================
+# Telegram (token/URL kesinlikle loga basılmaz)
+# ============================================================
 def send_telegram(text: str) -> None:
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        print("Telegram secrets missing (TELEGRAM_TOKEN / TELEGRAM_CHAT_ID). Printing only:\n")
+    if DEBUG_NO_TELEGRAM:
+        print("DEBUG_NO_TELEGRAM=True -> Telegram gönderimi kapalı. Mesaj aşağıda:\n")
         print(text)
         return
 
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        print("Telegram secrets missing (TELEGRAM_TOKEN / TELEGRAM_CHAT_ID). Mesaj aşağıda:\n")
+        print(text)
+        return
+
+    # Token içeren URL'yi asla print etmiyoruz
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    r = requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text}, timeout=20)
+    try:
+        r = requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text}, timeout=25)
+        if r.status_code != 200:
+            # r.text içinde token olmaz, ama gene de kısaltıyoruz
+            raise RuntimeError(f"Telegram send failed: HTTP {r.status_code}, body={r.text[:200]}")
+    except Exception as e:
+        # Token/URL loga düşmesin
+        raise RuntimeError(f"Telegram send exception: {type(e).__name__}: {str(e)[:200]}")
 
-    # Hata varsa workflow kırmızıya dönsün diye raise ediyoruz
-    if r.status_code != 200:
-        raise RuntimeError(f"Telegram send failed: {r.status_code} {r.text}")
-
+# ============================================================
+# Helpers
+# ============================================================
 def compute_atr(ohlc: pd.DataFrame, n: int) -> pd.Series:
     prev_close = ohlc["Close"].shift(1)
     tr = pd.concat(
@@ -76,21 +95,39 @@ def lot_from_risk(stop_distance_usd: float, risk_usd: float) -> float:
     return risk_usd / (stop_distance_usd * LOT_OZ)
 
 def fetch_ohlc(symbol: str) -> pd.DataFrame:
-    df = pd.read_csv(stooq_csv(symbol))
+    url = stooq_csv(symbol)
+    try:
+        df = pd.read_csv(url)
+    except Exception as e:
+        raise RuntimeError(f"Stooq read failed for {symbol}: {type(e).__name__}: {str(e)[:200]}")
+
+    # Beklenen kolonlar yoksa net hata verelim
+    needed = {"Date", "Open", "High", "Low", "Close"}
+    if not needed.issubset(set(df.columns)):
+        raise RuntimeError(f"Stooq columns missing for {symbol}. Got columns={list(df.columns)[:20]}")
+
     df["Date"] = pd.to_datetime(df["Date"])
     df = df.sort_values("Date").set_index("Date")
-    return df[["Open", "High", "Low", "Close"]]
+    df = df[["Open", "High", "Low", "Close"]].dropna()
 
-def make_features(xau: pd.DataFrame, dxy: pd.DataFrame, us10y: pd.DataFrame, vix: pd.DataFrame) -> pd.DataFrame:
-    # Close serileri
-    x = xau["Close"].rename("xau")
-    d = dxy["Close"].rename("dxy")
-    y = us10y["Close"].rename("us10y")
-    v = vix["Close"].rename("vix")
+    # Çok kısa dönüyorsa (boş/servis anomali) hata
+    if len(df) < 200:
+        raise RuntimeError(f"Stooq returned too few rows for {symbol}: rows={len(df)}")
 
-    df = pd.concat([x, d, y, v], axis=1).dropna()
+    return df
 
-    # Returns
+def make_features(xau_close: pd.Series, dxy_close: pd.Series, us10y_close: pd.Series, vix_close: pd.Series) -> pd.DataFrame:
+    df = pd.concat(
+        [
+            xau_close.rename("xau"),
+            dxy_close.rename("dxy"),
+            us10y_close.rename("us10y"),
+            vix_close.rename("vix"),
+        ],
+        axis=1,
+    ).dropna()
+
+    # Returns (log where sensible)
     df["x_ret1"] = np.log(df["xau"]).diff()
     df["x_ret3"] = np.log(df["xau"]).diff(3)
     df["x_ret5"] = np.log(df["xau"]).diff(5)
@@ -98,31 +135,41 @@ def make_features(xau: pd.DataFrame, dxy: pd.DataFrame, us10y: pd.DataFrame, vix
     df["dxy_ret1"] = np.log(df["dxy"]).diff()
     df["dxy_ret5"] = np.log(df["dxy"]).diff(5)
 
+    # yield farkı (log değil)
     df["us10y_chg1"] = df["us10y"].diff()
     df["us10y_chg5"] = df["us10y"].diff(5)
 
     df["vix_ret1"] = np.log(df["vix"]).diff()
     df["vix_ret5"] = np.log(df["vix"]).diff(5)
 
-    # Trend filter (MA50)
+    # Trend filter
     df["ma50"] = df["xau"].rolling(50).mean()
-    df["trend"] = (df["xau"] > df["ma50"]).astype(int)  # 1=uptrend, 0=downtrend
+    df["trend_up"] = (df["xau"] > df["ma50"]).astype(int)  # 1 uptrend
 
     return df
 
+# ============================================================
+# MAIN
+# ============================================================
 def main():
-    print("Downloading data...")
+    print("Downloading data from Stooq...")
     xau = fetch_ohlc(XAU)
     dxy = fetch_ohlc(DXY)
     us10y = fetch_ohlc(US10Y)
     vix = fetch_ohlc(VIX)
 
-    # ATR only on XAU
+    # ATR on XAU
     xau_atr = xau.copy()
     xau_atr["ATR"] = compute_atr(xau_atr, ATR_LEN)
 
-    feats = make_features(xau_atr, dxy, us10y, vix)
-    # Align ATR back
+    feats = make_features(
+        xau_atr["Close"],
+        dxy["Close"],
+        us10y["Close"],
+        vix["Close"],
+    )
+
+    # Align ATR
     feats = feats.join(xau_atr["ATR"].rename("atr"), how="left").dropna()
 
     # Label: tomorrow up?
@@ -134,17 +181,15 @@ def main():
         "dxy_ret1","dxy_ret5",
         "us10y_chg1","us10y_chg5",
         "vix_ret1","vix_ret5",
-        "trend",
+        "trend_up",
     ]
 
     if len(feats) < TRAIN_DAYS + 10:
-        raise RuntimeError(f"Not enough rows: {len(feats)} (need ~{TRAIN_DAYS})")
+        raise RuntimeError(f"Not enough aligned rows: {len(feats)} need~{TRAIN_DAYS}")
 
-    # Train on last TRAIN_DAYS ending at yesterday of last row
     X = feats[feature_cols]
     y = feats["y"]
 
-    # We want signal for last available day
     last_day = feats.index[-1]
     X_train = X.iloc[-TRAIN_DAYS-1:-1]
     y_train = y.iloc[-TRAIN_DAYS-1:-1]
@@ -158,10 +203,10 @@ def main():
 
     p_up = float(model.predict_proba(X_last)[:, 1][0])
 
-    # Decide signal with trend filter:
-    # Uptrend => only LONG allowed; Downtrend => only SHORT allowed
-    in_uptrend = int(feats.loc[last_day, "trend"]) == 1
+    in_uptrend = int(feats.loc[last_day, "trend_up"]) == 1
+    trend_txt = "UP" if in_uptrend else "DOWN"
 
+    # Az ama kaliteli + trend filtresi
     side = "NO-TRADE"
     if p_up > TH_LONG and in_uptrend:
         side = "LONG"
@@ -172,15 +217,13 @@ def main():
     atr = float(feats.loc[last_day, "atr"])
     stop_dist = STOP_ATR_MULT * atr
 
-    # Compose message (even if no-trade, log it)
     header = f"GOLD AI SIGNAL (XAUUSD)\nSignal date: {last_day.date()}\n"
-    info = f"P(up): {p_up:.4f}\nTrend(>MA50): {'UP' if in_uptrend else 'DOWN'}\n"
+    info = f"P(up): {p_up:.4f}\nTrend(>MA50): {trend_txt}\n"
 
     if side == "NO-TRADE":
         msg = header + "\n" + info + "\nSignal: NO-TRADE"
         print(msg)
-        if SEND_NO_TRADE:
-            send_telegram(msg)
+        # NO-TRADE'de telegram göndermiyoruz (az ama kaliteli)
         return
 
     if side == "LONG":
@@ -196,8 +239,8 @@ def main():
     min_lot_risk = MIN_LOT * stop_dist * LOT_OZ
     lot_note = ""
     if lot < MIN_LOT:
+        # İstersen burada NO-TRADE yapabiliriz; şimdilik uyarı basıp min lot yazıyoruz
         lot_note = f"⚠️ Suggested lot < min lot. Min lot {MIN_LOT:.2f} risk≈${min_lot_risk:.2f} (target ${RISK_USD:.2f})."
-        # İstersen burada “NO-TRADE” yapabiliriz. Şimdilik uyarı verip min lotu yazıyoruz:
         lot = MIN_LOT
 
     msg = (
@@ -226,4 +269,3 @@ if __name__ == "__main__":
         print("FATAL ERROR:", repr(e))
         traceback.print_exc()
         raise
-
