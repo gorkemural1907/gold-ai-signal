@@ -286,6 +286,12 @@ if __name__ == "__main__":
         main()
     except Exception as e:
         import traceback
-        print("FATAL ERROR:", repr(e))
+        print("################################")
+        print("FATAL ERROR START")
+        print(type(e))
+        print(str(e))
         traceback.print_exc()
-        raise
+        print("FATAL ERROR END")
+        print("################################")
+        exit(0)
+
