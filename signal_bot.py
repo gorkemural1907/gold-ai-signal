@@ -14,7 +14,7 @@ from sklearn.pipeline import Pipeline
 # Telegram & behavior
 # ============================================================
 DEBUG_NO_TELEGRAM = False      # True yaparsan Telegram yerine sadece loga yazar
-SEND_NO_TRADE = True           # True yaparsan NO-TRADE günlerinde de telegram mesajı atar
+SEND_NO_TRADE = True           # NO-TRADE günlerinde de telegram mesajı at
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -38,7 +38,6 @@ def send_telegram(text: str) -> None:
     try:
         r = requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text}, timeout=25)
         if r.status_code != 200:
-            # response text token içermez ama gene de KISITLI bilgi
             raise RuntimeError(f"Telegram HTTP {r.status_code}")
     except Exception:
         # ASLA exception metni basma (içinde token'lı URL geçebiliyor!)
@@ -48,9 +47,11 @@ def send_telegram(text: str) -> None:
 # Symbols (Stooq daily)
 # ============================================================
 XAU = "xauusd"
-DXY = "usdidx"
 US10Y = "10yusy.b"
 VIX = "vi.f"
+
+# DXY bazen boş dönebiliyor -> fallback listesi
+DXY_CANDIDATES = ["dx.f", "usd_i", "usdidx"]
 
 def stooq_url(symbol: str) -> str:
     return f"https://stooq.com/q/d/l/?s={symbol}&i=d"
@@ -59,8 +60,8 @@ def stooq_url(symbol: str) -> str:
 # Strategy / risk config
 # ============================================================
 TRAIN_DAYS = 252 * 5      # 5 yıl
-TH_LONG = 0.65            # az ama kaliteli (LONG eşiği)
-TH_SHORT = 0.35           # az ama kaliteli (SHORT eşiği)
+TH_LONG = 0.65
+TH_SHORT = 0.35
 
 ATR_LEN = 14
 STOP_ATR_MULT = 2.0
@@ -81,7 +82,6 @@ def round_down(x: float, step: float) -> float:
     return math.floor(x / step) * step if step > 0 else x
 
 def lot_from_risk(stop_distance_usd: float, risk_usd: float) -> float:
-    # 1$ fiyat hareketi => 1 lot PnL ~ 100$ (100 oz)
     if stop_distance_usd <= 0:
         return 0.0
     return risk_usd / (stop_distance_usd * LOT_OZ)
@@ -98,8 +98,10 @@ def compute_atr(ohlc: pd.DataFrame, n: int) -> pd.Series:
     ).max(axis=1)
     return tr.rolling(n).mean()
 
-def fetch_ohlc_stooq(symbol: str, retries: int = 3, sleep_s: float = 1.0) -> pd.DataFrame:
-    """Download OHLC from Stooq (daily). Retry, validate columns/rows."""
+def fetch_ohlc_stooq(symbol: str, retries: int = 4, sleep_s: float = 1.5) -> pd.DataFrame:
+    """
+    Download OHLC from Stooq (daily). Retry + validate columns/rows.
+    """
     url = stooq_url(symbol)
     last_err = None
 
@@ -133,23 +135,37 @@ def fetch_ohlc_stooq(symbol: str, retries: int = 3, sleep_s: float = 1.0) -> pd.
 
     raise RuntimeError(f"Stooq fetch failed for {symbol}: {type(last_err).__name__}: {str(last_err)[:200]}")
 
-def make_features(xau_close: pd.Series, dxy_close: pd.Series, us10y_close: pd.Series, vix_close: pd.Series) -> pd.DataFrame:
-    df = pd.concat(
-        [
-            xau_close.rename("xau"),
-            dxy_close.rename("dxy"),
-            us10y_close.rename("us10y"),
-            vix_close.rename("vix"),
-        ],
-        axis=1,
-    ).dropna()
+def fetch_dxy_with_fallback() -> tuple[pd.DataFrame | None, str | None]:
+    """
+    Try multiple DXY symbols. Return (df, used_symbol).
+    If all fail -> (None, None).
+    """
+    last_err = None
+    for sym in DXY_CANDIDATES:
+        try:
+            df = fetch_ohlc_stooq(sym, retries=6, sleep_s=2.0)
+            return df, sym
+        except Exception as e:
+            last_err = e
+
+    # DXY yok -> None
+    return None, None
+
+def make_features(xau_close: pd.Series, dxy_close: pd.Series | None, us10y_close: pd.Series, vix_close: pd.Series) -> pd.DataFrame:
+    # DXY yoksa hiç eklemeyelim, sonra feature_cols'ta da çıkartacağız
+    series = [xau_close.rename("xau"), us10y_close.rename("us10y"), vix_close.rename("vix")]
+    if dxy_close is not None:
+        series.insert(1, dxy_close.rename("dxy"))
+
+    df = pd.concat(series, axis=1).dropna()
 
     df["x_ret1"] = np.log(df["xau"]).diff()
     df["x_ret3"] = np.log(df["xau"]).diff(3)
     df["x_ret5"] = np.log(df["xau"]).diff(5)
 
-    df["dxy_ret1"] = np.log(df["dxy"]).diff()
-    df["dxy_ret5"] = np.log(df["dxy"]).diff(5)
+    if "dxy" in df.columns:
+        df["dxy_ret1"] = np.log(df["dxy"]).diff()
+        df["dxy_ret5"] = np.log(df["dxy"]).diff(5)
 
     df["us10y_chg1"] = df["us10y"].diff()
     df["us10y_chg5"] = df["us10y"].diff(5)
@@ -166,36 +182,46 @@ def make_features(xau_close: pd.Series, dxy_close: pd.Series, us10y_close: pd.Se
 # Main
 # ============================================================
 def main():
-    # Telegram bağlantısı çalışıyor mu testi
-    send_telegram("TEST: Bot çalıştı")
-
     print("Downloading data...")
+
     xau = fetch_ohlc_stooq(XAU)
-    dxy = fetch_ohlc_stooq(DXY)
     us10y = fetch_ohlc_stooq(US10Y)
     vix = fetch_ohlc_stooq(VIX)
 
+    dxy, used_dxy = fetch_dxy_with_fallback()
+    dxy_close = dxy["Close"] if dxy is not None else None
+
+    if dxy is None:
+        # DXY yok ama sistem dursun istemiyoruz
+        send_telegram("⚠️ DXY verisi alınamadı (dx.f/usd_i/usdidx). Bugün DXY features devre dışı.")
+
+    # ATR on XAU
     xau2 = xau.copy()
     xau2["ATR"] = compute_atr(xau2, ATR_LEN)
 
     feats = make_features(
         xau2["Close"],
-        dxy["Close"],
+        dxy_close,
         us10y["Close"],
         vix["Close"],
     )
     feats = feats.join(xau2["ATR"].rename("atr"), how="left").dropna()
 
+    # label: tomorrow up?
     feats["y"] = (feats["xau"].shift(-1) > feats["xau"]).astype(int)
     feats = feats.dropna()
 
+    # Feature set (DXY varsa ekle)
     feature_cols = [
         "x_ret1","x_ret3","x_ret5",
-        "dxy_ret1","dxy_ret5",
         "us10y_chg1","us10y_chg5",
         "vix_ret1","vix_ret5",
         "trend_up",
     ]
+    if dxy is not None and "dxy_ret1" in feats.columns and "dxy_ret5" in feats.columns:
+        # x_ret* sonrasına koy
+        feature_cols.insert(3, "dxy_ret1")
+        feature_cols.insert(4, "dxy_ret5")
 
     if len(feats) < TRAIN_DAYS + 10:
         raise RuntimeError(f"Not enough aligned rows: {len(feats)} need~{TRAIN_DAYS}")
@@ -219,6 +245,7 @@ def main():
     in_uptrend = int(feats.loc[last_day, "trend_up"]) == 1
     trend_txt = "UP" if in_uptrend else "DOWN"
 
+    # strict signal rules (az ama kaliteli)
     side = "NO-TRADE"
     if p_up > TH_LONG and in_uptrend:
         side = "LONG"
@@ -229,8 +256,10 @@ def main():
     atr = float(feats.loc[last_day, "atr"])
     stop_dist = STOP_ATR_MULT * atr
 
+    dxy_info = f"DXY source: {used_dxy}\n" if used_dxy else "DXY source: NONE\n"
+
     header = f"GOLD AI SIGNAL (XAUUSD)\nDate: {last_day.date()}\n"
-    info = f"P(up): {p_up:.4f}\nTrend(>MA50): {trend_txt}\n"
+    info = dxy_info + f"P(up): {p_up:.4f}\nTrend(>MA50): {trend_txt}\n"
 
     if side == "NO-TRADE":
         msg = header + "\n" + info + "\nSignal: NO-TRADE"
@@ -239,6 +268,7 @@ def main():
             send_telegram(msg)
         return
 
+    # SL/TP
     if side == "LONG":
         sl = entry - stop_dist
         tp = entry + RR * stop_dist
@@ -246,6 +276,7 @@ def main():
         sl = entry + stop_dist
         tp = entry - RR * stop_dist
 
+    # position size
     lot_raw = lot_from_risk(stop_dist, RISK_USD)
     lot = round_down(lot_raw, LOT_STEP)
 
@@ -280,22 +311,17 @@ if __name__ == "__main__":
     try:
         main()
     except Exception as e:
-        # GitHub logları bazen boş kalıyor; hatayı Telegram'a da yolla
+        # GitHub logları boş kalabiliyor -> hatayı Telegram'a da yolla
         err_type = type(e).__name__
         err_msg = str(e)
-        # çok uzunsa kısalt
         if len(err_msg) > 800:
             err_msg = err_msg[:800] + "..."
 
-        safe_text = f"❌ BOT ERROR\n{err_type}: {err_msg}"
         try:
-            send_telegram(safe_text)
+            send_telegram(f"❌ BOT ERROR\n{err_type}: {err_msg}")
         except Exception:
-            # telegram da patlarsa en azından workflow fail olur
             pass
 
         print("FATAL ERROR:", err_type)
         traceback.print_exc()
         raise
-
-
