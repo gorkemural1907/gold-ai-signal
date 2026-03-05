@@ -1,8 +1,6 @@
 name: Gold AI Signal
 
 on:
-  schedule:
-    - cron: "0 22 * * 1-5"
   workflow_dispatch:
 
 jobs:
@@ -22,7 +20,19 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run bot
-        
+      # Çalıştırmayı HER ZAMAN dosyaya yazdır
+      - name: Run bot (write log file)
         run: |
-          python -u signal_bot.py
+          set +e
+          python -u signal_bot.py > runlog.txt 2>&1
+          echo "EXIT_CODE=$?" >> runlog.txt
+          echo "---- LAST 120 LINES ----"
+          tail -n 120 runlog.txt || true
+
+      # Log dosyasını artifact olarak yükle (her zaman)
+      - name: Upload log artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: runlog
+          path: runlog.txt
+          if-no-files-found: error
