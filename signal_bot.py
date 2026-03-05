@@ -48,7 +48,7 @@ def send_telegram(text: str) -> None:
 # Symbols (Stooq daily)
 # ============================================================
 XAU = "xauusd"
-DXY = "dx.f"
+DXY = "usdidx"
 US10Y = "10yusy.b"
 VIX = "vi.f"
 
@@ -284,3 +284,4 @@ if __name__ == "__main__":
         print("FATAL ERROR:", f"{type(e).__name__}")
         traceback.print_exc()
         raise
+
