@@ -13,8 +13,8 @@ from sklearn.pipeline import Pipeline
 # ============================================================
 # Telegram & behavior
 # ============================================================
-DEBUG_NO_TELEGRAM = True       # True yaparsan Telegram yerine sadece loga yazar
-SEND_NO_TRADE = False           # True yaparsan NO-TRADE günlerinde de telegram mesajı atar
+DEBUG_NO_TELEGRAM = False       # True yaparsan Telegram yerine sadece loga yazar
+SEND_NO_TRADE = True           # True yaparsan NO-TRADE günlerinde de telegram mesajı atar
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -291,4 +291,5 @@ if __name__ == "__main__":
         print("FATAL ERROR:", f"{type(e).__name__}: {str(e)[:200]}")
         traceback.print_exc()
         raise
+
 
