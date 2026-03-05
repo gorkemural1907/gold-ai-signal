@@ -171,7 +171,10 @@ def make_features(xau_close: pd.Series, dxy_close: pd.Series, us10y_close: pd.Se
 # Main
 # ============================================================
 def main():
-    print("Downloading data...")
+
+    send_telegram("TEST: Bot çalıştı")
+
+    df = download_data()
     xau = fetch_ohlc_stooq(XAU)
     dxy = fetch_ohlc_stooq(DXY)
     us10y = fetch_ohlc_stooq(US10Y)
@@ -294,6 +297,7 @@ if __name__ == "__main__":
         print("FATAL ERROR:", f"{type(e).__name__}: {str(e)[:200]}")
         traceback.print_exc()
         raise
+
 
 
 
