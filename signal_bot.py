@@ -102,29 +102,34 @@ def fetch_optional(symbols: list[str], label: str) -> tuple[pd.DataFrame | None,
 XAU = "xauusd"  # required
 
 DXY_CANDIDATES    = ["dx.f", "usd_i", "usdidx"]
-VIX_CANDIDATES    = ["vi.f", "vix"]
 US10Y_CANDIDATES  = ["10yusy.b", "us10y"]
-
 SPX_CANDIDATES    = ["^spx"]
 TIPS_CANDIDATES   = ["tip.us"]
 IEF_CANDIDATES    = ["ief.us"]
+
+# VIX için daha geniş fallback (Stooq bazen boş dönüyor)
+VIX_CANDIDATES    = ["vi.f", "vix", "^vix", "vix.f"]
 
 # ============================================================
 # Strategy / risk config (MORE FREQUENT but still quality)
 # ============================================================
 TRAIN_DAYS = 252 * 5
 
-# Daha sık trade
 TH_LONG = 0.62
 TH_SHORT = 0.38
 MIN_EDGE = 0.12
 
-# En kaliteli gate
-REQUIRE_VIX_FOR_TRADE = True
+# VIX varsa kullan; yoksa SPX risk proxy ile devam
+REQUIRE_VIX_FOR_TRADE = False
 
-# Real-rate proxy (TIP/IEF) -> score adjustment (NOT hard block)
+# SPX risk proxy eşiği (VIX yoksa devreye girer)
+# abs(SPX 5g return) > 3% ise NO-TRADE
+SPX_RISK_PROXY_ON = True
+SPX_RET5_ABS_MAX = 0.03
+
+# Real-rate proxy (TIP/IEF) -> score adjustment
 REAL_FACTOR_LOOKBACK = 5
-REAL_BIAS = 0.015  # daha yumuşak bias
+REAL_BIAS = 0.015
 
 ATR_LEN = 14
 STOP_ATR_MULT = 2.0
@@ -242,11 +247,10 @@ def main():
 
     dxy, used_dxy = fetch_optional(DXY_CANDIDATES, "DXY")
     us10y, used_us10y = fetch_optional(US10Y_CANDIDATES, "US10Y")
-    vix, used_vix = fetch_optional(VIX_CANDIDATES, "VIX")
-
     spx, used_spx = fetch_optional(SPX_CANDIDATES, "SPX")
     tips, used_tips = fetch_optional(TIPS_CANDIDATES, "TIPS")
     ief, used_ief = fetch_optional(IEF_CANDIDATES, "IEF")
+    vix, used_vix = fetch_optional(VIX_CANDIDATES, "VIX")
 
     xau2 = xau.copy()
     xau2["ATR"] = compute_atr(xau2, ATR_LEN)
@@ -322,18 +326,36 @@ def main():
 
     p_up_adj = clamp01(p_up + bias)
 
-    # VIX gate
+    # Risk gate selection
     vix_available = used_vix is not None
+    risk_gate = "VIX" if vix_available else "SPX_PROXY"
     reason = ""
 
-    side = "NO-TRADE"
+    # If VIX is required (not in this version), block when missing
     if REQUIRE_VIX_FOR_TRADE and not vix_available:
+        side = "NO-TRADE"
         reason = "VIX missing -> quality filter"
     else:
-        if (p_up_adj > TH_LONG) and ((p_up_adj - 0.5) >= MIN_EDGE) and in_uptrend:
-            side = "LONG"
-        elif (p_up_adj < TH_SHORT) and ((0.5 - p_up_adj) >= MIN_EDGE) and (not in_uptrend):
-            side = "SHORT"
+        # If VIX missing, apply SPX proxy guardrail (if possible)
+        if (not vix_available) and SPX_RISK_PROXY_ON:
+            if "spx_ret5" in feats.columns:
+                spx_ret5 = float(feats.loc[last_day, "spx_ret5"])
+                if np.isfinite(spx_ret5) and abs(spx_ret5) > SPX_RET5_ABS_MAX:
+                    side = "NO-TRADE"
+                    reason = f"SPX proxy risk: abs(spx_ret5)>{SPX_RET5_ABS_MAX:.2%}"
+                else:
+                    side = None  # continue to signal rules
+            else:
+                side = None  # no proxy available
+        else:
+            side = None  # continue
+
+        if side is None:
+            side = "NO-TRADE"
+            if (p_up_adj > TH_LONG) and ((p_up_adj - 0.5) >= MIN_EDGE) and in_uptrend:
+                side = "LONG"
+            elif (p_up_adj < TH_SHORT) and ((0.5 - p_up_adj) >= MIN_EDGE) and (not in_uptrend):
+                side = "SHORT"
 
     mid = float(feats.loc[last_day, "xau"])
     atr = float(feats.loc[last_day, "atr"])
@@ -362,6 +384,7 @@ def main():
         + f"P(up): {p_up:.4f}\n"
         + f"P_adj: {p_up_adj:.4f} ({bias_reason})\n"
         + f"Trend(>MA50): {trend_txt}\n"
+        + f"RiskGate: {risk_gate}\n"
         + f"Spread: {SPREAD_BPS} bps (±{SPREAD_BPS/2:.1f} bps)\n"
     )
     if real_available:
