@@ -276,12 +276,26 @@ def main():
     send_telegram(msg)
 
 if __name__ == "__main__":
+    import traceback
     try:
         main()
     except Exception as e:
-        import traceback
-        # Token/URL asla print etmiyoruz ama hata türünü basabiliriz:
-        print("FATAL ERROR:", f"{type(e).__name__}")
+        # GitHub logları bazen boş kalıyor; hatayı Telegram'a da yolla
+        err_type = type(e).__name__
+        err_msg = str(e)
+        # çok uzunsa kısalt
+        if len(err_msg) > 800:
+            err_msg = err_msg[:800] + "..."
+
+        safe_text = f"❌ BOT ERROR\n{err_type}: {err_msg}"
+        try:
+            send_telegram(safe_text)
+        except Exception:
+            # telegram da patlarsa en azından workflow fail olur
+            pass
+
+        print("FATAL ERROR:", err_type)
         traceback.print_exc()
         raise
+
 
