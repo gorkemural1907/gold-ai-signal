@@ -1,13 +1,15 @@
 name: Gold AI Signal
 
 on:
-  workflow_dispatch:
   schedule:
-    - cron: "0 22 * * 1-5"
+    # 23:00 UTC (TR genelde UTC+3 => ~02:00). Haftanın her günü.
+    - cron: "0 23 * * *"
+  workflow_dispatch:
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -19,13 +21,9 @@ jobs:
 
       - name: Install packages
         run: |
-          set -euxo pipefail
-          python -V
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          ls -la
 
-      # Logu DOSYAYA yaz (UI gizlese bile dosyada durur)
       - name: Run bot (log to file)
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
@@ -37,7 +35,7 @@ jobs:
           echo "EXIT_CODE=$?" >> runlog.txt
           echo "=== LAST 120 LINES ==="
           tail -n 120 runlog.txt || true
-          # workflow kırmızı olsun ama log kalsın:
+          # Bot hata verdiyse job kırmızı olsun ama log kalsın:
           grep -q "EXIT_CODE=0" runlog.txt || exit 1
 
       - name: Upload run log artifact
