@@ -186,10 +186,10 @@ HALF_SPREAD = SPREAD / 2.0
 
 # chart structure thresholds
 STRUCT_LOOKBACK = 5
-CLOSE_NEAR_EXTREME_PCT = 0.30    # close top/bottom 30% of candle
+CLOSE_NEAR_EXTREME_PCT = 0.30
 WICK_TO_BODY_FAKE = 1.2
 SQUEEZE_LOOKBACK = 20
-SQUEEZE_RATIO_MAX = 0.90         # ATR14 < 90% of ATR20 median approx
+SQUEEZE_RATIO_MAX = 0.90
 
 # ============================================================
 # Helpers
@@ -229,22 +229,28 @@ def make_features(
     tips_close: pd.Series | None,
     ief_close: pd.Series | None,
 ) -> pd.DataFrame:
-    series = [xau_ohlc["Close"].rename("xau")]
+    base = [xau_ohlc["Close"].rename("xau")]
     if dxy_close is not None:
-        series.append(dxy_close.rename("dxy"))
+        base.append(dxy_close.rename("dxy"))
     if us10y_close is not None:
-        series.append(us10y_close.rename("us10y"))
+        base.append(us10y_close.rename("us10y"))
     if vix_close is not None:
-        series.append(vix_close.rename("vix"))
+        base.append(vix_close.rename("vix"))
     if spx_close is not None:
-        series.append(spx_close.rename("spx"))
+        base.append(spx_close.rename("spx"))
     if tips_close is not None:
-        series.append(tips_close.rename("tips"))
+        base.append(tips_close.rename("tips"))
     if ief_close is not None:
-        series.append(ief_close.rename("ief"))
+        base.append(ief_close.rename("ief"))
 
-    df = pd.concat(series, axis=1).dropna()
+    df = pd.concat(base, axis=1).dropna()
 
+    # Join XAU OHLC aligned to df index first
+    df = df.join(xau_ohlc[["Open", "High", "Low"]].rename(
+        columns={"Open": "open_xau", "High": "high_xau", "Low": "low_xau"}
+    ), how="left")
+
+    # Returns / changes on aligned df only
     df["x_ret1"] = np.log(df["xau"]).diff()
     df["x_ret3"] = np.log(df["xau"]).diff(3)
     df["x_ret5"] = np.log(df["xau"]).diff(5)
@@ -268,64 +274,49 @@ def make_features(
         df["real_factor"] = np.log(df["tips"] / df["ief"])
         df["real_f_chg5"] = df["real_factor"].diff(REAL_FACTOR_LOOKBACK)
 
-    # price structure features from XAU OHLC
-    o = xau_ohlc["Open"]
-    h = xau_ohlc["High"]
-    l = xau_ohlc["Low"]
-    c = xau_ohlc["Close"]
+    # ATRs aligned by index
+    atr14 = compute_atr(xau_ohlc, ATR_LEN).rename("atr14")
+    atr20 = compute_atr(xau_ohlc, ATR_SLOW_LEN).rename("atr20")
+    df = df.join(atr14, how="left")
+    df = df.join(atr20, how="left")
 
-    df = df.join(o.rename("open_xau"), how="left")
-    df = df.join(h.rename("high_xau"), how="left")
-    df = df.join(l.rename("low_xau"), how="left")
+    # Trend using aligned df columns only
+    df["ma50"] = df["xau"].rolling(50).mean()
+    df["trend_up"] = (df["xau"] > df["ma50"]).astype(int)
 
-    # ATRs
-    atr14 = compute_atr(xau_ohlc, ATR_LEN)
-    atr20 = compute_atr(xau_ohlc, ATR_SLOW_LEN)
-    df["atr14"] = atr14
-    df["atr20"] = atr20
+    # Structure using aligned OHLC columns
+    h = df["high_xau"]
+    l = df["low_xau"]
+    o = df["open_xau"]
+    c = df["xau"]
 
-    # trend
-    df["ma50"] = c.rolling(50).mean()
-    df["trend_up"] = (c > df["ma50"]).astype(int)
-
-    # structure: HH/HL and LH/LL over rolling lookback
     prev_high_max = h.shift(1).rolling(STRUCT_LOOKBACK).max()
     prev_low_min = l.shift(1).rolling(STRUCT_LOOKBACK).min()
-    prev_high_min = h.shift(1).rolling(STRUCT_LOOKBACK).min()
-    prev_low_max = l.shift(1).rolling(STRUCT_LOOKBACK).max()
 
     df["hh"] = (h > prev_high_max).astype(int)
     df["hl"] = (l > prev_low_min).astype(int)
     df["ll"] = (l < prev_low_min).astype(int)
     df["lh"] = (h < prev_high_max).astype(int)
 
-    # candle anatomy
     body = (c - o).abs()
     rng = (h - l).replace(0, np.nan)
     upper_wick = h - pd.concat([o, c], axis=1).max(axis=1)
     lower_wick = pd.concat([o, c], axis=1).min(axis=1) - l
 
-    df["close_pos"] = ((c - l) / rng).clip(0, 1)   # near 1 => close near high
+    df["close_pos"] = ((c - l) / rng).clip(0, 1)
     df["upper_wick_body"] = (upper_wick / body.replace(0, np.nan)).replace([np.inf, -np.inf], np.nan)
     df["lower_wick_body"] = (lower_wick / body.replace(0, np.nan)).replace([np.inf, -np.inf], np.nan)
 
-    # squeeze
-    atr20_med = atr20.rolling(SQUEEZE_LOOKBACK).median()
-    df["squeeze_on"] = ((atr14 / atr20_med) < SQUEEZE_RATIO_MAX).astype(int)
+    atr20_med = df["atr20"].rolling(SQUEEZE_LOOKBACK).median()
+    df["squeeze_on"] = ((df["atr14"] / atr20_med) < SQUEEZE_RATIO_MAX).astype(int)
 
-    # label
     df["y"] = (df["xau"].shift(-1) > df["xau"]).astype(int)
 
     df = df.dropna()
     return df
 
 def chart_filters(feats: pd.DataFrame, dt: pd.Timestamp, side: str) -> tuple[bool, str, int]:
-    """
-    Convert chart structure into filter + score.
-    Returns (pass, reason, score)
-    """
     r = feats.loc[dt]
-
     score = 0
     reasons = []
 
@@ -333,53 +324,39 @@ def chart_filters(feats: pd.DataFrame, dt: pd.Timestamp, side: str) -> tuple[boo
         structure_ok = (int(r["trend_up"]) == 1) and (int(r["hh"]) == 1 or int(r["hl"]) == 1)
         close_quality = float(r["close_pos"]) >= (1.0 - CLOSE_NEAR_EXTREME_PCT)
         fake_breakout = np.isfinite(r["upper_wick_body"]) and float(r["upper_wick_body"]) > WICK_TO_BODY_FAKE
-        wick_reject_ok = (not np.isfinite(r["upper_wick_body"])) or float(r["upper_wick_body"]) <= WICK_TO_BODY_FAKE
+        wick_ok = (not np.isfinite(r["upper_wick_body"])) or float(r["upper_wick_body"]) <= WICK_TO_BODY_FAKE
         squeeze_bonus = int(r["squeeze_on"]) == 1
 
-        if structure_ok:
-            score += 1
-        else:
-            reasons.append("weak market structure")
+        if structure_ok: score += 1
+        else: reasons.append("weak market structure")
 
-        if close_quality:
-            score += 1
-        else:
-            reasons.append("close not near high")
+        if close_quality: score += 1
+        else: reasons.append("close not near high")
 
-        if wick_reject_ok:
-            score += 1
-        else:
-            reasons.append("upper wick too large / fake breakout")
+        if wick_ok: score += 1
+        else: reasons.append("upper wick too large / fake breakout")
 
-        if squeeze_bonus:
-            score += 1
+        if squeeze_bonus: score += 1
 
         passed = structure_ok and close_quality and (not fake_breakout)
 
-    else:  # SHORT
+    else:
         structure_ok = (int(r["trend_up"]) == 0) and (int(r["ll"]) == 1 or int(r["lh"]) == 1)
         close_quality = float(r["close_pos"]) <= CLOSE_NEAR_EXTREME_PCT
         fake_breakout = np.isfinite(r["lower_wick_body"]) and float(r["lower_wick_body"]) > WICK_TO_BODY_FAKE
-        wick_reject_ok = (not np.isfinite(r["lower_wick_body"])) or float(r["lower_wick_body"]) <= WICK_TO_BODY_FAKE
+        wick_ok = (not np.isfinite(r["lower_wick_body"])) or float(r["lower_wick_body"]) <= WICK_TO_BODY_FAKE
         squeeze_bonus = int(r["squeeze_on"]) == 1
 
-        if structure_ok:
-            score += 1
-        else:
-            reasons.append("weak market structure")
+        if structure_ok: score += 1
+        else: reasons.append("weak market structure")
 
-        if close_quality:
-            score += 1
-        else:
-            reasons.append("close not near low")
+        if close_quality: score += 1
+        else: reasons.append("close not near low")
 
-        if wick_reject_ok:
-            score += 1
-        else:
-            reasons.append("lower wick too large / fake breakout")
+        if wick_ok: score += 1
+        else: reasons.append("lower wick too large / fake breakout")
 
-        if squeeze_bonus:
-            score += 1
+        if squeeze_bonus: score += 1
 
         passed = structure_ok and close_quality and (not fake_breakout)
 
@@ -431,16 +408,15 @@ def evaluate_tracking(state: dict, xau_ohlc: pd.DataFrame) -> tuple[dict, list[s
                 f"SL: {sl:.2f}\n"
                 f"TP: {tp:.2f}"
             )
-        else:
-            if valid_until and str(last_bar_date.date()) >= valid_until:
-                t["status"] = "CANCELLED"
-                msgs.append(
-                    "⏹️ SETUP CANCELLED\n"
-                    f"Date: {last_bar_date.date()}\n"
-                    f"Reason: Not triggered before next NY close\n"
-                    f"Side: {side}\n"
-                    f"Entry: {entry:.2f}"
-                )
+        elif valid_until and str(last_bar_date.date()) >= valid_until:
+            t["status"] = "CANCELLED"
+            msgs.append(
+                "⏹️ SETUP CANCELLED\n"
+                f"Date: {last_bar_date.date()}\n"
+                f"Reason: Not triggered before next NY close\n"
+                f"Side: {side}\n"
+                f"Entry: {entry:.2f}"
+            )
 
     if t.get("status") == "OPEN":
         hit_sl = hit_tp = False
@@ -485,10 +461,7 @@ def main():
         send_telegram(m)
 
     trade = state.get("trade", {})
-    trade_status = trade.get("status")
-
-    # one active setup only
-    if trade_status in ("PENDING", "OPEN"):
+    if trade.get("status") in ("PENDING", "OPEN"):
         save_state(state)
         return
 
@@ -587,7 +560,6 @@ def main():
         elif (p_up_adj < TH_SHORT) and ((0.5 - p_up_adj) >= MIN_EDGE) and (not in_uptrend):
             side = "SHORT"
 
-    # chart structure filter
     chart_ok = False
     chart_reason = ""
     chart_score = 0
@@ -629,13 +601,11 @@ def main():
 
     trade_skipped = False
     skip_reason = ""
-
-    if side in ("LONG", "SHORT"):
-        if lot < MIN_LOT:
-            real_risk_usd = MIN_LOT * stop_dist * LOT_OZ
-            trade_skipped = True
-            skip_reason = f"Risk too large for account. Min lot risk=${real_risk_usd:.2f} > max ${MAX_RISK_USD:.2f}"
-            lot = MIN_LOT
+    if side in ("LONG", "SHORT") and lot < MIN_LOT:
+        real_risk_usd = MIN_LOT * stop_dist * LOT_OZ
+        trade_skipped = True
+        skip_reason = f"Risk too large for account. Min lot risk=${real_risk_usd:.2f} > max ${MAX_RISK_USD:.2f}"
+        lot = MIN_LOT
 
     valid_until = str(last_day.date())
 
