@@ -39,6 +39,9 @@ def send_telegram(text: str) -> None:
     if r.status_code != 200:
         raise RuntimeError(f"Telegram HTTP {r.status_code}")
 
+def safe_symbol(s: str | None) -> str:
+    return s.replace(".", "_") if s else "NONE"
+
 # ============================================================
 # Persistent state
 # ============================================================
@@ -191,6 +194,10 @@ WICK_TO_BODY_FAKE = 1.2
 SQUEEZE_LOOKBACK = 20
 SQUEEZE_RATIO_MAX = 0.90
 
+# management thresholds
+EXIT_P_ADJ_LONG = 0.52
+EXIT_P_ADJ_SHORT = 0.48
+
 # ============================================================
 # Helpers
 # ============================================================
@@ -218,7 +225,7 @@ def clamp01(x: float) -> float:
     return float(min(0.999, max(0.001, x)))
 
 # ============================================================
-# Feature engineering
+# Features
 # ============================================================
 def make_features(
     xau_ohlc: pd.DataFrame,
@@ -245,12 +252,10 @@ def make_features(
 
     df = pd.concat(base, axis=1).dropna()
 
-    # Join XAU OHLC aligned to df index first
     df = df.join(xau_ohlc[["Open", "High", "Low"]].rename(
         columns={"Open": "open_xau", "High": "high_xau", "Low": "low_xau"}
     ), how="left")
 
-    # Returns / changes on aligned df only
     df["x_ret1"] = np.log(df["xau"]).diff()
     df["x_ret3"] = np.log(df["xau"]).diff(3)
     df["x_ret5"] = np.log(df["xau"]).diff(5)
@@ -274,17 +279,14 @@ def make_features(
         df["real_factor"] = np.log(df["tips"] / df["ief"])
         df["real_f_chg5"] = df["real_factor"].diff(REAL_FACTOR_LOOKBACK)
 
-    # ATRs aligned by index
     atr14 = compute_atr(xau_ohlc, ATR_LEN).rename("atr14")
     atr20 = compute_atr(xau_ohlc, ATR_SLOW_LEN).rename("atr20")
     df = df.join(atr14, how="left")
     df = df.join(atr20, how="left")
 
-    # Trend using aligned df columns only
     df["ma50"] = df["xau"].rolling(50).mean()
     df["trend_up"] = (df["xau"] > df["ma50"]).astype(int)
 
-    # Structure using aligned OHLC columns
     h = df["high_xau"]
     l = df["low_xau"]
     o = df["open_xau"]
@@ -329,13 +331,10 @@ def chart_filters(feats: pd.DataFrame, dt: pd.Timestamp, side: str) -> tuple[boo
 
         if structure_ok: score += 1
         else: reasons.append("weak market structure")
-
         if close_quality: score += 1
         else: reasons.append("close not near high")
-
         if wick_ok: score += 1
         else: reasons.append("upper wick too large / fake breakout")
-
         if squeeze_bonus: score += 1
 
         passed = structure_ok and close_quality and (not fake_breakout)
@@ -349,13 +348,10 @@ def chart_filters(feats: pd.DataFrame, dt: pd.Timestamp, side: str) -> tuple[boo
 
         if structure_ok: score += 1
         else: reasons.append("weak market structure")
-
         if close_quality: score += 1
         else: reasons.append("close not near low")
-
         if wick_ok: score += 1
         else: reasons.append("lower wick too large / fake breakout")
-
         if squeeze_bonus: score += 1
 
         passed = structure_ok and close_quality and (not fake_breakout)
@@ -364,9 +360,10 @@ def chart_filters(feats: pd.DataFrame, dt: pd.Timestamp, side: str) -> tuple[boo
     return passed, reason, score
 
 # ============================================================
-# Tracking
+# Tracking / management
 # ============================================================
-def evaluate_tracking(state: dict, xau_ohlc: pd.DataFrame) -> tuple[dict, list[str]]:
+def evaluate_tracking(state: dict, xau_ohlc: pd.DataFrame, feats: pd.DataFrame | None = None,
+                      p_up_adj: float | None = None) -> tuple[dict, list[str]]:
     msgs: list[str] = []
     if len(xau_ohlc) < 3:
         return state, msgs
@@ -375,6 +372,7 @@ def evaluate_tracking(state: dict, xau_ohlc: pd.DataFrame) -> tuple[dict, list[s
     bar = xau_ohlc.iloc[-1]
     h = float(bar["High"])
     l = float(bar["Low"])
+    c = float(bar["Close"])
 
     t = state.get("trade")
     if not isinstance(t, dict):
@@ -389,6 +387,7 @@ def evaluate_tracking(state: dict, xau_ohlc: pd.DataFrame) -> tuple[dict, list[s
     sl = float(t.get("sl", 0) or 0)
     tp = float(t.get("tp", 0) or 0)
     valid_until = t.get("valid_until")
+    stop_dist = float(t.get("stop_dist", 0) or 0)
 
     if status == "PENDING":
         triggered = False
@@ -400,6 +399,7 @@ def evaluate_tracking(state: dict, xau_ohlc: pd.DataFrame) -> tuple[dict, list[s
         if triggered:
             t["status"] = "OPEN"
             t["open_date"] = str(last_bar_date.date())
+            t["be_moved"] = False
             msgs.append(
                 "✅ TRADE TRIGGERED\n"
                 f"Date: {last_bar_date.date()}\n"
@@ -419,30 +419,90 @@ def evaluate_tracking(state: dict, xau_ohlc: pd.DataFrame) -> tuple[dict, list[s
             )
 
     if t.get("status") == "OPEN":
-        hit_sl = hit_tp = False
-        if side == "LONG":
-            hit_sl = l <= sl
-            hit_tp = h >= tp
-        elif side == "SHORT":
-            hit_sl = h >= sl
-            hit_tp = l <= tp
+        # move stop to breakeven after 1R in favor
+        be_moved = bool(t.get("be_moved", False))
+        if (not be_moved) and stop_dist > 0:
+            if side == "LONG" and h >= entry + stop_dist:
+                t["sl"] = entry
+                t["be_moved"] = True
+                sl = entry
+                msgs.append(
+                    "🟦 MOVE STOP TO BREAK-EVEN\n"
+                    f"Date: {last_bar_date.date()}\n"
+                    f"Side: {side}\n"
+                    f"New SL: {entry:.2f}"
+                )
+            elif side == "SHORT" and l <= entry - stop_dist:
+                t["sl"] = entry
+                t["be_moved"] = True
+                sl = entry
+                msgs.append(
+                    "🟦 MOVE STOP TO BREAK-EVEN\n"
+                    f"Date: {last_bar_date.date()}\n"
+                    f"Side: {side}\n"
+                    f"New SL: {entry:.2f}"
+                )
 
-        if hit_sl or hit_tp:
-            result = "STOP" if hit_sl else "TAKE_PROFIT"
-            if hit_sl and hit_tp:
-                result = "STOP"
-            t["status"] = "CLOSED"
-            t["result"] = result
-            t["close_date"] = str(last_bar_date.date())
+        # exit now logic using latest model / chart deterioration
+        if feats is not None and p_up_adj is not None and last_bar_date in feats.index:
+            chart_ok, chart_reason, _ = chart_filters(feats, last_bar_date, side)
+            exit_now = False
+            exit_reason = ""
 
-            msgs.append(
-                ("🟥 TRADE CLOSED (STOP)\n" if result == "STOP" else "🟩 TRADE CLOSED (TAKE PROFIT)\n")
-                + f"Date: {last_bar_date.date()}\n"
-                + f"Side: {side}\n"
-                + f"Entry: {entry:.2f}\n"
-                + f"SL: {sl:.2f}\n"
-                + f"TP: {tp:.2f}"
-            )
+            if side == "LONG":
+                if p_up_adj < EXIT_P_ADJ_LONG:
+                    exit_now = True
+                    exit_reason = f"AI weakened (P_adj={p_up_adj:.4f})"
+                elif not chart_ok:
+                    exit_now = True
+                    exit_reason = f"Chart weakened ({chart_reason})"
+            elif side == "SHORT":
+                if p_up_adj > EXIT_P_ADJ_SHORT:
+                    exit_now = True
+                    exit_reason = f"AI weakened (P_adj={p_up_adj:.4f})"
+                elif not chart_ok:
+                    exit_now = True
+                    exit_reason = f"Chart weakened ({chart_reason})"
+
+            if exit_now:
+                t["status"] = "CLOSED"
+                t["result"] = "EXIT_NOW"
+                t["close_date"] = str(last_bar_date.date())
+                msgs.append(
+                    "🟨 EXIT NOW\n"
+                    f"Date: {last_bar_date.date()}\n"
+                    f"Side: {side}\n"
+                    f"Reason: {exit_reason}\n"
+                    f"Close: {c:.2f}"
+                )
+
+        # normal SL/TP checks only if still open
+        if t.get("status") == "OPEN":
+            hit_sl = hit_tp = False
+            current_sl = float(t.get("sl", sl) or sl)
+            if side == "LONG":
+                hit_sl = l <= current_sl
+                hit_tp = h >= tp
+            elif side == "SHORT":
+                hit_sl = h >= current_sl
+                hit_tp = l <= tp
+
+            if hit_sl or hit_tp:
+                result = "STOP" if hit_sl else "TAKE_PROFIT"
+                if hit_sl and hit_tp:
+                    result = "STOP"
+                t["status"] = "CLOSED"
+                t["result"] = result
+                t["close_date"] = str(last_bar_date.date())
+
+                msgs.append(
+                    ("🟥 TRADE CLOSED (STOP)\n" if result == "STOP" else "🟩 TRADE CLOSED (TAKE PROFIT)\n")
+                    + f"Date: {last_bar_date.date()}\n"
+                    + f"Side: {side}\n"
+                    + f"Entry: {entry:.2f}\n"
+                    + f"SL: {current_sl:.2f}\n"
+                    + f"TP: {tp:.2f}"
+                )
 
     t["last_processed_date"] = str(last_bar_date.date())
     state["trade"] = t
@@ -453,17 +513,7 @@ def evaluate_tracking(state: dict, xau_ohlc: pd.DataFrame) -> tuple[dict, list[s
 # ============================================================
 def main():
     state = load_state()
-
     xau = fetch_required_xau(XAU_SYMBOL)
-
-    state, track_msgs = evaluate_tracking(state, xau)
-    for m in track_msgs:
-        send_telegram(m)
-
-    trade = state.get("trade", {})
-    if trade.get("status") in ("PENDING", "OPEN"):
-        save_state(state)
-        return
 
     dxy, used_dxy = fetch_optional(DXY_CANDIDATES, "DXY")
     us10y, used_us10y = fetch_optional(US10Y_CANDIDATES, "US10Y")
@@ -514,9 +564,6 @@ def main():
 
     p_up = float(model.predict_proba(X_last)[:, 1][0])
 
-    in_uptrend = int(feats.loc[last_day, "trend_up"]) == 1
-    trend_txt = "UP" if in_uptrend else "DOWN"
-
     real_available = "real_f_chg5" in feats.columns
     real_chg5 = float(feats.loc[last_day, "real_f_chg5"]) if real_available else float("nan")
 
@@ -531,8 +578,20 @@ def main():
             bias_reason = f"RealBias: -{REAL_BIAS:.3f} (real down)"
         else:
             bias_reason = "RealBias: +0.000 (flat)"
-
     p_up_adj = clamp01(p_up + bias)
+
+    # first manage old setup/trade using latest info
+    state, track_msgs = evaluate_tracking(state, xau, feats=feats, p_up_adj=p_up_adj)
+    for m in track_msgs:
+        send_telegram(m)
+
+    trade = state.get("trade", {})
+    if trade.get("status") in ("PENDING", "OPEN"):
+        save_state(state)
+        return
+
+    in_uptrend = int(feats.loc[last_day, "trend_up"]) == 1
+    trend_txt = "UP" if in_uptrend else "DOWN"
 
     vix_available = used_vix is not None
     risk_gate = "VIX" if vix_available else "SPX_PROXY"
@@ -569,7 +628,6 @@ def main():
             side = "NO-TRADE"
             reason = f"Chart filter: {chart_reason}"
 
-    # breakout entry from yesterday bar
     ybar = xau.iloc[-2]
     y_high = float(ybar["High"])
     y_low = float(ybar["Low"])
@@ -611,13 +669,13 @@ def main():
 
     src = (
         f"Sources:\n"
-        f"XAU: {XAU_SYMBOL}\n"
-        f"DXY: {used_dxy or 'NONE'}\n"
-        f"US10Y: {used_us10y or 'NONE'}\n"
-        f"VIX: {used_vix or 'NONE'}\n"
-        f"SPX: {used_spx or 'NONE'}\n"
-        f"TIPS: {used_tips or 'NONE'}\n"
-        f"IEF: {used_ief or 'NONE'}\n"
+        f"XAU: {safe_symbol(XAU_SYMBOL)}\n"
+        f"DXY: {safe_symbol(used_dxy)}\n"
+        f"US10Y: {safe_symbol(used_us10y)}\n"
+        f"VIX: {safe_symbol(used_vix)}\n"
+        f"SPX: {safe_symbol(used_spx)}\n"
+        f"TIPS: {safe_symbol(used_tips)}\n"
+        f"IEF: {safe_symbol(used_ief)}\n"
     )
 
     header = f"GOLD AI SIGNAL (XAUUSD)\nDate: {last_day.date()}\n"
@@ -696,6 +754,8 @@ def main():
         "sl": float(sl),
         "tp": float(tp),
         "lot": float(lot),
+        "stop_dist": float(stop_dist),
+        "be_moved": False,
         "last_processed_date": state.get("trade", {}).get("last_processed_date")
     }
     save_state(state)
