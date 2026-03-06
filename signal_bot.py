@@ -1,17 +1,19 @@
 import os
 import math
 import time
+import json
 import requests
 import pandas as pd
 import numpy as np
 from io import StringIO
+from pathlib import Path
 
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import Pipeline
 
 # ============================================================
-# Telegram & behavior
+# Telegram
 # ============================================================
 DEBUG_NO_TELEGRAM = False
 SEND_NO_TRADE = True
@@ -31,21 +33,36 @@ def send_telegram(text: str) -> None:
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
         "text": text,
-        "disable_web_page_preview": True,  # link preview kapalı
+        "disable_web_page_preview": True,
     }
-    try:
-        r = requests.post(url, json=payload, timeout=25)
-        if r.status_code != 200:
-            raise RuntimeError(f"Telegram HTTP {r.status_code}")
-    except Exception:
-        raise RuntimeError("Telegram send failed (network/api).")
+    r = requests.post(url, json=payload, timeout=25)
+    if r.status_code != 200:
+        raise RuntimeError(f"Telegram HTTP {r.status_code}")
 
 # ============================================================
-# Stooq download (rate-limit friendly)
+# Persistent state
+# ============================================================
+STATE_DIR = Path(".bot_state")
+STATE_PATH = STATE_DIR / "state.json"
+
+def load_state() -> dict:
+    if STATE_PATH.exists():
+        try:
+            return json.loads(STATE_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+    return {}
+
+def save_state(state: dict) -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    STATE_PATH.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+
+# ============================================================
+# Stooq
 # ============================================================
 SESSION = requests.Session()
 SESSION.headers.update({
-    "User-Agent": "Mozilla/5.0 (compatible; GoldAISignal/1.0; +https://github.com/)"
+    "User-Agent": "Mozilla/5.0 (compatible; GoldAISignal/1.0)"
 })
 
 FETCH_PAUSE_S = 0.6
@@ -93,24 +110,17 @@ def fetch_ohlc_stooq(symbol: str, retries: int = 5, sleep_s: float = 2.0) -> pd.
 def fetch_optional(symbols: list[str], label: str) -> tuple[pd.DataFrame | None, str | None]:
     for sym in symbols:
         try:
-            df = fetch_ohlc_stooq(sym)
-            return df, sym
+            return fetch_ohlc_stooq(sym), sym
         except Exception:
             pass
-
-    send_telegram(f"⚠️ {label} verisi alınamadı ({'/'.join(symbols)}). Bugün {label} features devre dışı.")
+    print(f"[WARN] {label} missing: {symbols}")
     return None, None
 
-def fetch_required_xau_with_dynamic_sanity(symbol: str = "xauusd") -> pd.DataFrame:
-    """
-    XAU required + dinamik sanity:
-    - Son 60 gün medyanına göre band (0.5x .. 2.0x)
-    - Günlük jump > 25% ise şüpheli
-    """
+def fetch_required_xau(symbol: str = "xauusd") -> pd.DataFrame:
     df = fetch_ohlc_stooq(symbol)
     closes = df["Close"].astype(float).dropna()
     if len(closes) < 180:
-        raise RuntimeError(f"XAU sanity needs more history: rows={len(closes)}")
+        raise RuntimeError(f"XAU sanity needs more history: {len(closes)}")
 
     last_close = float(closes.iloc[-1])
     prev_close = float(closes.iloc[-2])
@@ -120,7 +130,7 @@ def fetch_required_xau_with_dynamic_sanity(symbol: str = "xauusd") -> pd.DataFra
     hi = 2.00 * med60
     if not (lo <= last_close <= hi):
         raise RuntimeError(
-            f"XAU sanity fail: last_close={last_close:.2f} not in [{lo:.2f},{hi:.2f}] (med60={med60:.2f})"
+            f"XAU sanity fail: last_close={last_close:.2f} not in [{lo:.2f},{hi:.2f}]"
         )
 
     if prev_close > 0:
@@ -131,21 +141,18 @@ def fetch_required_xau_with_dynamic_sanity(symbol: str = "xauusd") -> pd.DataFra
     return df
 
 # ============================================================
-# Symbols (fallback lists)
+# Symbols
 # ============================================================
-XAU_SYMBOL = "xauusd"  # tek kullanıyoruz (diğerleri boş dönüyordu)
-
-DXY_CANDIDATES    = ["dx.f", "usd_i", "usdidx"]
-US10Y_CANDIDATES  = ["10yusy.b", "us10y"]
-SPX_CANDIDATES    = ["^spx"]
-TIPS_CANDIDATES   = ["tip.us"]
-IEF_CANDIDATES    = ["ief.us"]
-
-# VIX için geniş fallback
-VIX_CANDIDATES    = ["vi.f", "vix", "^vix", "vix.f"]
+XAU_SYMBOL = "xauusd"
+DXY_CANDIDATES = ["dx.f", "usd_i", "usdidx"]
+US10Y_CANDIDATES = ["10yusy.b", "us10y"]
+VIX_CANDIDATES = ["vi.f", "vix", "^vix", "vix.f"]
+SPX_CANDIDATES = ["^spx"]
+TIPS_CANDIDATES = ["tip.us"]
+IEF_CANDIDATES = ["ief.us"]
 
 # ============================================================
-# Strategy / risk config (more frequent, still quality)
+# Strategy config
 # ============================================================
 TRAIN_DAYS = 252 * 5
 
@@ -153,36 +160,31 @@ TH_LONG = 0.62
 TH_SHORT = 0.38
 MIN_EDGE = 0.12
 
-# VIX varsa kullan; yoksa SPX proxy ile devam
 REQUIRE_VIX_FOR_TRADE = False
-
-# VIX yoksa devreye girer
 SPX_RISK_PROXY_ON = True
-SPX_RET5_ABS_MAX = 0.03  # abs(spx_ret5) > 3% ise NO-TRADE
+SPX_RET5_ABS_MAX = 0.03
 
-# TIP/IEF real-rate proxy bias
 REAL_FACTOR_LOOKBACK = 5
 REAL_BIAS = 0.015
 
 ATR_LEN = 14
-STOP_ATR_MULT = 2.0
+STOP_ATR_MULT = 1.2
 RR = 2.0
 
 ACCOUNT_USD = 1000.0
-RISK_PCT = 1.0
-RISK_USD = ACCOUNT_USD * (RISK_PCT / 100.0)
+MAX_RISK_PCT = 2.0
+MAX_RISK_USD = ACCOUNT_USD * (MAX_RISK_PCT / 100.0)
 
 LOT_OZ = 100.0
 MIN_LOT = 0.01
 LOT_STEP = 0.01
 
-# Spread (10 bps)
 SPREAD_BPS = 10
 SPREAD = SPREAD_BPS / 10000.0
 HALF_SPREAD = SPREAD / 2.0
 
 # ============================================================
-# Indicators / helpers
+# Helpers
 # ============================================================
 def compute_atr(ohlc: pd.DataFrame, n: int) -> pd.Series:
     prev_close = ohlc["Close"].shift(1)
@@ -219,7 +221,6 @@ def make_features(
     tips_close: pd.Series | None,
     ief_close: pd.Series | None,
 ) -> pd.DataFrame:
-
     series = [xau_close.rename("xau")]
     if dxy_close is not None:
         series.append(dxy_close.rename("dxy"))
@@ -253,40 +254,133 @@ def make_features(
         df["vix_ret5"] = np.log(df["vix"]).diff(5)
 
     if "spx" in df.columns:
-        df["spx_ret1"] = np.log(df["spx"]).diff()
         df["spx_ret5"] = np.log(df["spx"]).diff(5)
 
-    if "tips" in df.columns:
-        df["tips_ret1"] = np.log(df["tips"]).diff()
-        df["tips_ret5"] = np.log(df["tips"]).diff(5)
-
-    # TIP/IEF real-rate proxy
     if "tips" in df.columns and "ief" in df.columns:
         df["real_factor"] = np.log(df["tips"] / df["ief"])
         df["real_f_chg5"] = df["real_factor"].diff(REAL_FACTOR_LOOKBACK)
 
-    # Trend filter
     df["ma50"] = df["xau"].rolling(50).mean()
     df["trend_up"] = (df["xau"] > df["ma50"]).astype(int)
 
     return df
 
 # ============================================================
+# Tracking
+# ============================================================
+def evaluate_tracking(state: dict, xau_ohlc: pd.DataFrame) -> tuple[dict, list[str]]:
+    msgs: list[str] = []
+    if len(xau_ohlc) < 3:
+        return state, msgs
+
+    last_bar_date = xau_ohlc.index[-1]
+    bar = xau_ohlc.iloc[-1]
+    h = float(bar["High"])
+    l = float(bar["Low"])
+
+    t = state.get("trade")
+    if not isinstance(t, dict):
+        return state, msgs
+
+    if t.get("last_processed_date") == str(last_bar_date.date()):
+        return state, msgs
+
+    status = t.get("status")
+    side = t.get("side")
+    entry = float(t.get("entry", 0) or 0)
+    sl = float(t.get("sl", 0) or 0)
+    tp = float(t.get("tp", 0) or 0)
+    valid_until = t.get("valid_until")
+
+    # pending -> triggered / expired
+    if status == "PENDING":
+        triggered = False
+        if side == "LONG" and h >= entry:
+            triggered = True
+        elif side == "SHORT" and l <= entry:
+            triggered = True
+
+        if triggered:
+            t["status"] = "OPEN"
+            t["open_date"] = str(last_bar_date.date())
+            msgs.append(
+                "✅ TRADE TRIGGERED\n"
+                f"Date: {last_bar_date.date()}\n"
+                f"Side: {side}\n"
+                f"Entry: {entry:.2f}\n"
+                f"SL: {sl:.2f}\n"
+                f"TP: {tp:.2f}"
+            )
+        else:
+            if valid_until and str(last_bar_date.date()) >= valid_until:
+                t["status"] = "CANCELLED"
+                msgs.append(
+                    "⏹️ SETUP CANCELLED\n"
+                    f"Date: {last_bar_date.date()}\n"
+                    f"Reason: Not triggered before next NY close\n"
+                    f"Side: {side}\n"
+                    f"Entry: {entry:.2f}"
+                )
+
+    # open -> closed
+    if t.get("status") == "OPEN":
+        hit_sl = hit_tp = False
+        if side == "LONG":
+            hit_sl = l <= sl
+            hit_tp = h >= tp
+        elif side == "SHORT":
+            hit_sl = h >= sl
+            hit_tp = l <= tp
+
+        if hit_sl or hit_tp:
+            result = "STOP" if hit_sl else "TAKE_PROFIT"
+            if hit_sl and hit_tp:
+                result = "STOP"
+
+            t["status"] = "CLOSED"
+            t["result"] = result
+            t["close_date"] = str(last_bar_date.date())
+
+            msgs.append(
+                ("🟥 TRADE CLOSED (STOP)\n" if result == "STOP" else "🟩 TRADE CLOSED (TAKE PROFIT)\n")
+                + f"Date: {last_bar_date.date()}\n"
+                + f"Side: {side}\n"
+                + f"Entry: {entry:.2f}\n"
+                + f"SL: {sl:.2f}\n"
+                + f"TP: {tp:.2f}"
+            )
+
+    t["last_processed_date"] = str(last_bar_date.date())
+    state["trade"] = t
+    return state, msgs
+
+# ============================================================
 # Main
 # ============================================================
 def main():
-    print("Downloading data...")
+    state = load_state()
 
-    # Required XAU (dinamik sanity)
-    xau = fetch_required_xau_with_dynamic_sanity(XAU_SYMBOL)
-    used_xau = XAU_SYMBOL
+    xau = fetch_required_xau(XAU_SYMBOL)
+
+    # first update previous setup/trade
+    state, track_msgs = evaluate_tracking(state, xau)
+    for m in track_msgs:
+        send_telegram(m)
+
+    trade = state.get("trade", {})
+    trade_status = trade.get("status")
+
+    # if still pending/open, do not create a new signal
+    if trade_status in ("PENDING", "OPEN"):
+        save_state(state)
+        return
 
     dxy, used_dxy = fetch_optional(DXY_CANDIDATES, "DXY")
     us10y, used_us10y = fetch_optional(US10Y_CANDIDATES, "US10Y")
+    vix, used_vix = fetch_optional(VIX_CANDIDATES, "VIX")
     spx, used_spx = fetch_optional(SPX_CANDIDATES, "SPX")
     tips, used_tips = fetch_optional(TIPS_CANDIDATES, "TIPS")
     ief, used_ief = fetch_optional(IEF_CANDIDATES, "IEF")
-    vix, used_vix = fetch_optional(VIX_CANDIDATES, "VIX")
 
     xau2 = xau.copy()
     xau2["ATR"] = compute_atr(xau2, ATR_LEN)
@@ -300,7 +394,6 @@ def main():
         tips["Close"] if tips is not None else None,
         ief["Close"] if ief is not None else None,
     )
-
     feats = feats.join(xau2["ATR"].rename("atr"), how="left").dropna()
     feats["y"] = (feats["xau"].shift(-1) > feats["xau"]).astype(int)
     feats = feats.dropna()
@@ -312,10 +405,8 @@ def main():
         feature_cols += ["us10y_chg1", "us10y_chg5"]
     if "vix_ret1" in feats.columns and "vix_ret5" in feats.columns:
         feature_cols += ["vix_ret1", "vix_ret5"]
-    if "spx_ret1" in feats.columns and "spx_ret5" in feats.columns:
-        feature_cols += ["spx_ret1", "spx_ret5"]
-    if "tips_ret1" in feats.columns and "tips_ret5" in feats.columns:
-        feature_cols += ["tips_ret1", "tips_ret5"]
+    if "spx_ret5" in feats.columns:
+        feature_cols += ["spx_ret5"]
     if "real_f_chg5" in feats.columns:
         feature_cols += ["real_f_chg5"]
     feature_cols += ["trend_up"]
@@ -342,7 +433,6 @@ def main():
     in_uptrend = int(feats.loc[last_day, "trend_up"]) == 1
     trend_txt = "UP" if in_uptrend else "DOWN"
 
-    # Real bias
     real_available = "real_f_chg5" in feats.columns
     real_chg5 = float(feats.loc[last_day, "real_f_chg5"]) if real_available else float("nan")
 
@@ -360,11 +450,11 @@ def main():
 
     p_up_adj = clamp01(p_up + bias)
 
-    # Risk gate: VIX varsa VIX, yoksa SPX proxy
     vix_available = used_vix is not None
     risk_gate = "VIX" if vix_available else "SPX_PROXY"
     reason = ""
 
+    side = None
     if REQUIRE_VIX_FOR_TRADE and not vix_available:
         side = "NO-TRADE"
         reason = "VIX missing -> quality filter"
@@ -375,35 +465,61 @@ def main():
                 if np.isfinite(spx_ret5) and abs(spx_ret5) > SPX_RET5_ABS_MAX:
                     side = "NO-TRADE"
                     reason = f"SPX proxy risk: abs(spx_ret5)>{SPX_RET5_ABS_MAX:.2%}"
-                else:
-                    side = None
             else:
                 side = "NO-TRADE"
                 reason = "Risk data missing (no VIX, no SPX)"
-        else:
-            side = None
 
-        if side is None:
-            side = "NO-TRADE"
-            if (p_up_adj > TH_LONG) and ((p_up_adj - 0.5) >= MIN_EDGE) and in_uptrend:
-                side = "LONG"
-            elif (p_up_adj < TH_SHORT) and ((0.5 - p_up_adj) >= MIN_EDGE) and (not in_uptrend):
-                side = "SHORT"
+    if side is None:
+        side = "NO-TRADE"
+        if (p_up_adj > TH_LONG) and ((p_up_adj - 0.5) >= MIN_EDGE) and in_uptrend:
+            side = "LONG"
+        elif (p_up_adj < TH_SHORT) and ((0.5 - p_up_adj) >= MIN_EDGE) and (not in_uptrend):
+            side = "SHORT"
 
-    mid = float(feats.loc[last_day, "xau"])
+    # breakout entry from yesterday bar
+    ybar = xau2.iloc[-2]
+    y_high = float(ybar["High"])
+    y_low = float(ybar["Low"])
+
+    spread_long = y_high * HALF_SPREAD
+    spread_short = y_low * HALF_SPREAD
+
+    if side == "LONG":
+        entry = y_high + spread_long
+    elif side == "SHORT":
+        entry = y_low - spread_short
+    else:
+        entry = float(xau2["Close"].iloc[-1])
+
     atr = float(feats.loc[last_day, "atr"])
     stop_dist = STOP_ATR_MULT * atr
 
     if side == "LONG":
-        entry_exec = mid * (1.0 + HALF_SPREAD)
+        sl = entry - stop_dist
+        tp = entry + RR * stop_dist
     elif side == "SHORT":
-        entry_exec = mid * (1.0 - HALF_SPREAD)
+        sl = entry + stop_dist
+        tp = entry - RR * stop_dist
     else:
-        entry_exec = mid
+        sl = tp = float("nan")
+
+    lot_raw = lot_from_risk(stop_dist, MAX_RISK_USD)
+    lot = round_down(lot_raw, LOT_STEP)
+
+    trade_skipped = False
+    skip_reason = ""
+
+    if side in ("LONG", "SHORT"):
+        if lot < MIN_LOT:
+            # real minimum lot risk
+            real_risk_usd = MIN_LOT * stop_dist * LOT_OZ
+            trade_skipped = True
+            skip_reason = f"Risk too large for account. Min lot risk=${real_risk_usd:.2f} > max ${MAX_RISK_USD:.2f}"
+            lot = MIN_LOT
 
     src = (
         f"Sources:\n"
-        f"XAU: {used_xau}\n"
+        f"XAU: {XAU_SYMBOL}\n"
         f"DXY: {used_dxy or 'NONE'}\n"
         f"US10Y: {used_us10y or 'NONE'}\n"
         f"VIX: {used_vix or 'NONE'}\n"
@@ -411,6 +527,8 @@ def main():
         f"TIPS: {used_tips or 'NONE'}\n"
         f"IEF: {used_ief or 'NONE'}\n"
     )
+
+    valid_until = str(last_day.date())
 
     header = f"GOLD AI SIGNAL (XAUUSD)\nDate: {last_day.date()}\n"
     info = (
@@ -420,11 +538,10 @@ def main():
         + f"Trend(>MA50): {trend_txt}\n"
         + f"RiskGate: {risk_gate}\n"
         + f"Spread: {SPREAD_BPS} bps (±{SPREAD_BPS/2:.1f} bps)\n"
+        + f"RealFactor chg{REAL_FACTOR_LOOKBACK}: {real_chg5:+.4f}\n" if real_available else
+          f"RealFactor chg{REAL_FACTOR_LOOKBACK}: N/A\n"
     )
-    if real_available:
-        info += f"RealFactor chg{REAL_FACTOR_LOOKBACK}: {real_chg5:+.4f}\n"
-    else:
-        info += f"RealFactor chg{REAL_FACTOR_LOOKBACK}: N/A\n"
+
     if reason:
         info += f"Filter: {reason}\n"
 
@@ -433,38 +550,61 @@ def main():
         print(msg)
         if SEND_NO_TRADE:
             send_telegram(msg)
+        save_state(state)
         return
 
-    if side == "LONG":
-        sl = entry_exec - stop_dist
-        tp = entry_exec + RR * stop_dist
-    else:
-        sl = entry_exec + stop_dist
-        tp = entry_exec - RR * stop_dist
-
-    lot_raw = lot_from_risk(stop_dist, RISK_USD)
-    lot = round_down(lot_raw, LOT_STEP)
-    if lot < MIN_LOT:
-        lot = MIN_LOT
+    if trade_skipped:
+        msg = (
+            header + "\n"
+            + info + "\n"
+            + f"Signal: {side}\n"
+            + "Trade: SKIPPED\n"
+            + f"Reason: {skip_reason}\n\n"
+            + f"Breakout Entry: {entry:.2f}\n"
+            + f"Stop Loss: {sl:.2f}\n"
+            + f"Take Profit: {tp:.2f}\n"
+            + f"ATR({ATR_LEN}): {atr:.2f}\n"
+            + f"StopDist: {stop_dist:.2f} ({STOP_ATR_MULT:.1f}x ATR)\n"
+            + f"Max risk: ${MAX_RISK_USD:.2f} ({MAX_RISK_PCT:.1f}%)\n"
+            + f"Order valid until next NY close: {valid_until}\n"
+        )
+        print(msg)
+        send_telegram(msg)
+        save_state(state)
+        return
 
     msg = (
         header + "\n"
         + info + "\n"
         + f"Signal: {side}\n\n"
-        + f"Mid (Close): {mid:.2f}\n"
-        + f"Entry (spread adj): {entry_exec:.2f}\n"
+        + f"Breakout Entry: {entry:.2f}\n"
+        + f"Yesterday High: {y_high:.2f}\n"
+        + f"Yesterday Low: {y_low:.2f}\n"
         + f"Stop Loss: {sl:.2f}\n"
         + f"Take Profit: {tp:.2f}\n"
         + f"ATR({ATR_LEN}): {atr:.2f}\n"
         + f"StopDist: {stop_dist:.2f} ({STOP_ATR_MULT:.1f}x ATR)\n"
         + f"RR: {RR:.1f}R\n\n"
         + f"Account: ${ACCOUNT_USD:.0f}\n"
-        + f"Risk: ${RISK_USD:.2f} ({RISK_PCT:.1f}%)\n"
+        + f"Max risk: ${MAX_RISK_USD:.2f} ({MAX_RISK_PCT:.1f}%)\n"
         + f"Suggested lot: {lot:.2f}\n"
+        + f"Order valid until next NY close: {valid_until}\n"
     )
-
     print(msg)
     send_telegram(msg)
+
+    state["trade"] = {
+        "status": "PENDING",
+        "created_date": str(last_day.date()),
+        "valid_until": valid_until,
+        "side": side,
+        "entry": float(entry),
+        "sl": float(sl),
+        "tp": float(tp),
+        "lot": float(lot),
+        "last_processed_date": state.get("trade", {}).get("last_processed_date")
+    }
+    save_state(state)
 
 if __name__ == "__main__":
     import traceback
