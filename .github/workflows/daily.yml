@@ -2,7 +2,7 @@ name: Gold AI Signal
 
 on:
   schedule:
-    # 23:00 UTC (TR genelde UTC+3 => ~02:00). Haftanın her günü.
+    # Her gün 23:00 UTC
     - cron: "0 23 * * *"
   workflow_dispatch:
 
@@ -19,29 +19,27 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Restore bot state cache
+        uses: actions/cache/restore@v4
+        with:
+          path: .bot_state
+          key: bot-state
+
       - name: Install packages
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run bot (log to file)
+      - name: Run bot
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          set +e
-          echo "=== START ===" > runlog.txt
-          python -u -X faulthandler signal_bot.py >> runlog.txt 2>&1
-          echo "EXIT_CODE=$?" >> runlog.txt
-          echo "=== LAST 120 LINES ==="
-          tail -n 120 runlog.txt || true
-          # Bot hata verdiyse job kırmızı olsun ama log kalsın:
-          grep -q "EXIT_CODE=0" runlog.txt || exit 1
+          python -u signal_bot.py
 
-      - name: Upload run log artifact
+      - name: Save bot state cache
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/cache/save@v4
         with:
-          name: runlog
-          path: runlog.txt
-          if-no-files-found: error
+          path: .bot_state
+          key: bot-state
