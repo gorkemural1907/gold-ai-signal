@@ -168,6 +168,7 @@ REAL_FACTOR_LOOKBACK = 5
 REAL_BIAS = 0.015
 
 ATR_LEN = 14
+ATR_SLOW_LEN = 20
 STOP_ATR_MULT = 1.2
 RR = 2.0
 
@@ -182,6 +183,13 @@ LOT_STEP = 0.01
 SPREAD_BPS = 10
 SPREAD = SPREAD_BPS / 10000.0
 HALF_SPREAD = SPREAD / 2.0
+
+# chart structure thresholds
+STRUCT_LOOKBACK = 5
+CLOSE_NEAR_EXTREME_PCT = 0.30    # close top/bottom 30% of candle
+WICK_TO_BODY_FAKE = 1.2
+SQUEEZE_LOOKBACK = 20
+SQUEEZE_RATIO_MAX = 0.90         # ATR14 < 90% of ATR20 median approx
 
 # ============================================================
 # Helpers
@@ -210,10 +218,10 @@ def clamp01(x: float) -> float:
     return float(min(0.999, max(0.001, x)))
 
 # ============================================================
-# Features
+# Feature engineering
 # ============================================================
 def make_features(
-    xau_close: pd.Series,
+    xau_ohlc: pd.DataFrame,
     dxy_close: pd.Series | None,
     us10y_close: pd.Series | None,
     vix_close: pd.Series | None,
@@ -221,7 +229,7 @@ def make_features(
     tips_close: pd.Series | None,
     ief_close: pd.Series | None,
 ) -> pd.DataFrame:
-    series = [xau_close.rename("xau")]
+    series = [xau_ohlc["Close"].rename("xau")]
     if dxy_close is not None:
         series.append(dxy_close.rename("dxy"))
     if us10y_close is not None:
@@ -260,10 +268,123 @@ def make_features(
         df["real_factor"] = np.log(df["tips"] / df["ief"])
         df["real_f_chg5"] = df["real_factor"].diff(REAL_FACTOR_LOOKBACK)
 
-    df["ma50"] = df["xau"].rolling(50).mean()
-    df["trend_up"] = (df["xau"] > df["ma50"]).astype(int)
+    # price structure features from XAU OHLC
+    o = xau_ohlc["Open"]
+    h = xau_ohlc["High"]
+    l = xau_ohlc["Low"]
+    c = xau_ohlc["Close"]
 
+    df = df.join(o.rename("open_xau"), how="left")
+    df = df.join(h.rename("high_xau"), how="left")
+    df = df.join(l.rename("low_xau"), how="left")
+
+    # ATRs
+    atr14 = compute_atr(xau_ohlc, ATR_LEN)
+    atr20 = compute_atr(xau_ohlc, ATR_SLOW_LEN)
+    df["atr14"] = atr14
+    df["atr20"] = atr20
+
+    # trend
+    df["ma50"] = c.rolling(50).mean()
+    df["trend_up"] = (c > df["ma50"]).astype(int)
+
+    # structure: HH/HL and LH/LL over rolling lookback
+    prev_high_max = h.shift(1).rolling(STRUCT_LOOKBACK).max()
+    prev_low_min = l.shift(1).rolling(STRUCT_LOOKBACK).min()
+    prev_high_min = h.shift(1).rolling(STRUCT_LOOKBACK).min()
+    prev_low_max = l.shift(1).rolling(STRUCT_LOOKBACK).max()
+
+    df["hh"] = (h > prev_high_max).astype(int)
+    df["hl"] = (l > prev_low_min).astype(int)
+    df["ll"] = (l < prev_low_min).astype(int)
+    df["lh"] = (h < prev_high_max).astype(int)
+
+    # candle anatomy
+    body = (c - o).abs()
+    rng = (h - l).replace(0, np.nan)
+    upper_wick = h - pd.concat([o, c], axis=1).max(axis=1)
+    lower_wick = pd.concat([o, c], axis=1).min(axis=1) - l
+
+    df["close_pos"] = ((c - l) / rng).clip(0, 1)   # near 1 => close near high
+    df["upper_wick_body"] = (upper_wick / body.replace(0, np.nan)).replace([np.inf, -np.inf], np.nan)
+    df["lower_wick_body"] = (lower_wick / body.replace(0, np.nan)).replace([np.inf, -np.inf], np.nan)
+
+    # squeeze
+    atr20_med = atr20.rolling(SQUEEZE_LOOKBACK).median()
+    df["squeeze_on"] = ((atr14 / atr20_med) < SQUEEZE_RATIO_MAX).astype(int)
+
+    # label
+    df["y"] = (df["xau"].shift(-1) > df["xau"]).astype(int)
+
+    df = df.dropna()
     return df
+
+def chart_filters(feats: pd.DataFrame, dt: pd.Timestamp, side: str) -> tuple[bool, str, int]:
+    """
+    Convert chart structure into filter + score.
+    Returns (pass, reason, score)
+    """
+    r = feats.loc[dt]
+
+    score = 0
+    reasons = []
+
+    if side == "LONG":
+        structure_ok = (int(r["trend_up"]) == 1) and (int(r["hh"]) == 1 or int(r["hl"]) == 1)
+        close_quality = float(r["close_pos"]) >= (1.0 - CLOSE_NEAR_EXTREME_PCT)
+        fake_breakout = np.isfinite(r["upper_wick_body"]) and float(r["upper_wick_body"]) > WICK_TO_BODY_FAKE
+        wick_reject_ok = (not np.isfinite(r["upper_wick_body"])) or float(r["upper_wick_body"]) <= WICK_TO_BODY_FAKE
+        squeeze_bonus = int(r["squeeze_on"]) == 1
+
+        if structure_ok:
+            score += 1
+        else:
+            reasons.append("weak market structure")
+
+        if close_quality:
+            score += 1
+        else:
+            reasons.append("close not near high")
+
+        if wick_reject_ok:
+            score += 1
+        else:
+            reasons.append("upper wick too large / fake breakout")
+
+        if squeeze_bonus:
+            score += 1
+
+        passed = structure_ok and close_quality and (not fake_breakout)
+
+    else:  # SHORT
+        structure_ok = (int(r["trend_up"]) == 0) and (int(r["ll"]) == 1 or int(r["lh"]) == 1)
+        close_quality = float(r["close_pos"]) <= CLOSE_NEAR_EXTREME_PCT
+        fake_breakout = np.isfinite(r["lower_wick_body"]) and float(r["lower_wick_body"]) > WICK_TO_BODY_FAKE
+        wick_reject_ok = (not np.isfinite(r["lower_wick_body"])) or float(r["lower_wick_body"]) <= WICK_TO_BODY_FAKE
+        squeeze_bonus = int(r["squeeze_on"]) == 1
+
+        if structure_ok:
+            score += 1
+        else:
+            reasons.append("weak market structure")
+
+        if close_quality:
+            score += 1
+        else:
+            reasons.append("close not near low")
+
+        if wick_reject_ok:
+            score += 1
+        else:
+            reasons.append("lower wick too large / fake breakout")
+
+        if squeeze_bonus:
+            score += 1
+
+        passed = structure_ok and close_quality and (not fake_breakout)
+
+    reason = "ok" if passed else "; ".join(reasons[:3])
+    return passed, reason, score
 
 # ============================================================
 # Tracking
@@ -292,7 +413,6 @@ def evaluate_tracking(state: dict, xau_ohlc: pd.DataFrame) -> tuple[dict, list[s
     tp = float(t.get("tp", 0) or 0)
     valid_until = t.get("valid_until")
 
-    # pending -> triggered / expired
     if status == "PENDING":
         triggered = False
         if side == "LONG" and h >= entry:
@@ -322,7 +442,6 @@ def evaluate_tracking(state: dict, xau_ohlc: pd.DataFrame) -> tuple[dict, list[s
                     f"Entry: {entry:.2f}"
                 )
 
-    # open -> closed
     if t.get("status") == "OPEN":
         hit_sl = hit_tp = False
         if side == "LONG":
@@ -336,7 +455,6 @@ def evaluate_tracking(state: dict, xau_ohlc: pd.DataFrame) -> tuple[dict, list[s
             result = "STOP" if hit_sl else "TAKE_PROFIT"
             if hit_sl and hit_tp:
                 result = "STOP"
-
             t["status"] = "CLOSED"
             t["result"] = result
             t["close_date"] = str(last_bar_date.date())
@@ -362,7 +480,6 @@ def main():
 
     xau = fetch_required_xau(XAU_SYMBOL)
 
-    # first update previous setup/trade
     state, track_msgs = evaluate_tracking(state, xau)
     for m in track_msgs:
         send_telegram(m)
@@ -370,7 +487,7 @@ def main():
     trade = state.get("trade", {})
     trade_status = trade.get("status")
 
-    # if still pending/open, do not create a new signal
+    # one active setup only
     if trade_status in ("PENDING", "OPEN"):
         save_state(state)
         return
@@ -382,21 +499,15 @@ def main():
     tips, used_tips = fetch_optional(TIPS_CANDIDATES, "TIPS")
     ief, used_ief = fetch_optional(IEF_CANDIDATES, "IEF")
 
-    xau2 = xau.copy()
-    xau2["ATR"] = compute_atr(xau2, ATR_LEN)
-
     feats = make_features(
-        xau2["Close"],
-        dxy["Close"] if dxy is not None else None,
-        us10y["Close"] if us10y is not None else None,
-        vix["Close"] if vix is not None else None,
-        spx["Close"] if spx is not None else None,
-        tips["Close"] if tips is not None else None,
-        ief["Close"] if ief is not None else None,
+        xau_ohlc=xau,
+        dxy_close=dxy["Close"] if dxy is not None else None,
+        us10y_close=us10y["Close"] if us10y is not None else None,
+        vix_close=vix["Close"] if vix is not None else None,
+        spx_close=spx["Close"] if spx is not None else None,
+        tips_close=tips["Close"] if tips is not None else None,
+        ief_close=ief["Close"] if ief is not None else None,
     )
-    feats = feats.join(xau2["ATR"].rename("atr"), how="left").dropna()
-    feats["y"] = (feats["xau"].shift(-1) > feats["xau"]).astype(int)
-    feats = feats.dropna()
 
     feature_cols = ["x_ret1", "x_ret3", "x_ret5"]
     if "dxy_ret1" in feats.columns and "dxy_ret5" in feats.columns:
@@ -476,8 +587,18 @@ def main():
         elif (p_up_adj < TH_SHORT) and ((0.5 - p_up_adj) >= MIN_EDGE) and (not in_uptrend):
             side = "SHORT"
 
+    # chart structure filter
+    chart_ok = False
+    chart_reason = ""
+    chart_score = 0
+    if side in ("LONG", "SHORT"):
+        chart_ok, chart_reason, chart_score = chart_filters(feats, last_day, side)
+        if not chart_ok:
+            side = "NO-TRADE"
+            reason = f"Chart filter: {chart_reason}"
+
     # breakout entry from yesterday bar
-    ybar = xau2.iloc[-2]
+    ybar = xau.iloc[-2]
     y_high = float(ybar["High"])
     y_low = float(ybar["Low"])
 
@@ -489,9 +610,9 @@ def main():
     elif side == "SHORT":
         entry = y_low - spread_short
     else:
-        entry = float(xau2["Close"].iloc[-1])
+        entry = float(xau["Close"].iloc[-1])
 
-    atr = float(feats.loc[last_day, "atr"])
+    atr = float(feats.loc[last_day, "atr14"])
     stop_dist = STOP_ATR_MULT * atr
 
     if side == "LONG":
@@ -511,11 +632,12 @@ def main():
 
     if side in ("LONG", "SHORT"):
         if lot < MIN_LOT:
-            # real minimum lot risk
             real_risk_usd = MIN_LOT * stop_dist * LOT_OZ
             trade_skipped = True
             skip_reason = f"Risk too large for account. Min lot risk=${real_risk_usd:.2f} > max ${MAX_RISK_USD:.2f}"
             lot = MIN_LOT
+
+    valid_until = str(last_day.date())
 
     src = (
         f"Sources:\n"
@@ -528,8 +650,6 @@ def main():
         f"IEF: {used_ief or 'NONE'}\n"
     )
 
-    valid_until = str(last_day.date())
-
     header = f"GOLD AI SIGNAL (XAUUSD)\nDate: {last_day.date()}\n"
     info = (
         src
@@ -537,11 +657,13 @@ def main():
         + f"P_adj: {p_up_adj:.4f} ({bias_reason})\n"
         + f"Trend(>MA50): {trend_txt}\n"
         + f"RiskGate: {risk_gate}\n"
+        + f"ChartScore: {chart_score}/4\n"
         + f"Spread: {SPREAD_BPS} bps (±{SPREAD_BPS/2:.1f} bps)\n"
-        + f"RealFactor chg{REAL_FACTOR_LOOKBACK}: {real_chg5:+.4f}\n" if real_available else
-          f"RealFactor chg{REAL_FACTOR_LOOKBACK}: N/A\n"
     )
-
+    if real_available:
+        info += f"RealFactor chg{REAL_FACTOR_LOOKBACK}: {real_chg5:+.4f}\n"
+    else:
+        info += f"RealFactor chg{REAL_FACTOR_LOOKBACK}: N/A\n"
     if reason:
         info += f"Filter: {reason}\n"
 
@@ -563,6 +685,8 @@ def main():
             + f"Breakout Entry: {entry:.2f}\n"
             + f"Stop Loss: {sl:.2f}\n"
             + f"Take Profit: {tp:.2f}\n"
+            + f"Yesterday High: {y_high:.2f}\n"
+            + f"Yesterday Low: {y_low:.2f}\n"
             + f"ATR({ATR_LEN}): {atr:.2f}\n"
             + f"StopDist: {stop_dist:.2f} ({STOP_ATR_MULT:.1f}x ATR)\n"
             + f"Max risk: ${MAX_RISK_USD:.2f} ({MAX_RISK_PCT:.1f}%)\n"
