@@ -268,8 +268,8 @@ def make_features(
         df["us10y_chg1"] = df["us10y"].diff()
         df["us10y_chg5"] = df["us10y"].diff(5)
 
-        # NEW: gold vs nominal yield spread
-        df["gold_real_spread"] = df["xau"] / df["us10y"].replace(0, np.nan)
+        # FIXED: log spread instead of raw ratio
+        df["gold_real_spread"] = np.log(df["xau"] / df["us10y"].replace(0, np.nan))
         df["gold_real_mom"] = df["gold_real_spread"].diff(5)
 
     if "vix" in df.columns:
@@ -279,8 +279,8 @@ def make_features(
     if "spx" in df.columns:
         df["spx_ret5"] = np.log(df["spx"]).diff(5)
 
-        # NEW: gold vs equities spread
-        df["gold_spx_spread"] = df["xau"] / df["spx"].replace(0, np.nan)
+        # FIXED: log spread instead of raw ratio
+        df["gold_spx_spread"] = np.log(df["xau"] / df["spx"].replace(0, np.nan))
         df["gold_spx_mom"] = df["gold_spx_spread"].diff(5)
 
     if "tips" in df.columns and "ief" in df.columns:
