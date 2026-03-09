@@ -268,12 +268,20 @@ def make_features(
         df["us10y_chg1"] = df["us10y"].diff()
         df["us10y_chg5"] = df["us10y"].diff(5)
 
+        # NEW: gold vs nominal yield spread
+        df["gold_real_spread"] = df["xau"] / df["us10y"].replace(0, np.nan)
+        df["gold_real_mom"] = df["gold_real_spread"].diff(5)
+
     if "vix" in df.columns:
         df["vix_ret1"] = np.log(df["vix"]).diff()
         df["vix_ret5"] = np.log(df["vix"]).diff(5)
 
     if "spx" in df.columns:
         df["spx_ret5"] = np.log(df["spx"]).diff(5)
+
+        # NEW: gold vs equities spread
+        df["gold_spx_spread"] = df["xau"] / df["spx"].replace(0, np.nan)
+        df["gold_spx_mom"] = df["gold_spx_spread"].diff(5)
 
     if "tips" in df.columns and "ief" in df.columns:
         df["real_factor"] = np.log(df["tips"] / df["ief"])
@@ -419,7 +427,6 @@ def evaluate_tracking(state: dict, xau_ohlc: pd.DataFrame, feats: pd.DataFrame |
             )
 
     if t.get("status") == "OPEN":
-        # move stop to breakeven after 1R in favor
         be_moved = bool(t.get("be_moved", False))
         if (not be_moved) and stop_dist > 0:
             if side == "LONG" and h >= entry + stop_dist:
@@ -443,7 +450,6 @@ def evaluate_tracking(state: dict, xau_ohlc: pd.DataFrame, feats: pd.DataFrame |
                     f"New SL: {entry:.2f}"
                 )
 
-        # exit now logic using latest model / chart deterioration
         if feats is not None and p_up_adj is not None and last_bar_date in feats.index:
             chart_ok, chart_reason, _ = chart_filters(feats, last_bar_date, side)
             exit_now = False
@@ -476,7 +482,6 @@ def evaluate_tracking(state: dict, xau_ohlc: pd.DataFrame, feats: pd.DataFrame |
                     f"Close: {c:.2f}"
                 )
 
-        # normal SL/TP checks only if still open
         if t.get("status") == "OPEN":
             hit_sl = hit_tp = False
             current_sl = float(t.get("sl", sl) or sl)
@@ -537,10 +542,14 @@ def main():
         feature_cols += ["dxy_ret1", "dxy_ret5"]
     if "us10y_chg1" in feats.columns and "us10y_chg5" in feats.columns:
         feature_cols += ["us10y_chg1", "us10y_chg5"]
+    if "gold_real_mom" in feats.columns:
+        feature_cols += ["gold_real_mom"]
     if "vix_ret1" in feats.columns and "vix_ret5" in feats.columns:
         feature_cols += ["vix_ret1", "vix_ret5"]
     if "spx_ret5" in feats.columns:
         feature_cols += ["spx_ret5"]
+    if "gold_spx_mom" in feats.columns:
+        feature_cols += ["gold_spx_mom"]
     if "real_f_chg5" in feats.columns:
         feature_cols += ["real_f_chg5"]
     feature_cols += ["trend_up"]
@@ -580,7 +589,6 @@ def main():
             bias_reason = "RealBias: +0.000 (flat)"
     p_up_adj = clamp01(p_up + bias)
 
-    # first manage old setup/trade using latest info
     state, track_msgs = evaluate_tracking(state, xau, feats=feats, p_up_adj=p_up_adj)
     for m in track_msgs:
         send_telegram(m)
@@ -692,6 +700,10 @@ def main():
         info += f"RealFactor chg{REAL_FACTOR_LOOKBACK}: {real_chg5:+.4f}\n"
     else:
         info += f"RealFactor chg{REAL_FACTOR_LOOKBACK}: N/A\n"
+    if "gold_real_mom" in feats.columns:
+        info += f"GoldRealMom5: {float(feats.loc[last_day, 'gold_real_mom']):+.4f}\n"
+    if "gold_spx_mom" in feats.columns:
+        info += f"GoldSPXMom5: {float(feats.loc[last_day, 'gold_spx_mom']):+.4f}\n"
     if reason:
         info += f"Filter: {reason}\n"
 
