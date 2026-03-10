@@ -187,12 +187,14 @@ SPREAD_BPS = 10
 SPREAD = SPREAD_BPS / 10000.0
 HALF_SPREAD = SPREAD / 2.0
 
-# chart structure thresholds
+# chart / vol thresholds
 STRUCT_LOOKBACK = 5
 CLOSE_NEAR_EXTREME_PCT = 0.30
 WICK_TO_BODY_FAKE = 1.2
 SQUEEZE_LOOKBACK = 20
 SQUEEZE_RATIO_MAX = 0.90
+VOL_EXPANSION_MIN_DELTA = 0.03   # atr_ratio today - yesterday
+VOL_EXPANSION_RATIO_MIN = 0.95   # atr14 / atr20 median üstüne toparlanma
 
 # management thresholds
 EXIT_P_ADJ_LONG = 0.52
@@ -252,9 +254,12 @@ def make_features(
 
     df = pd.concat(base, axis=1).dropna()
 
-    df = df.join(xau_ohlc[["Open", "High", "Low"]].rename(
-        columns={"Open": "open_xau", "High": "high_xau", "Low": "low_xau"}
-    ), how="left")
+    df = df.join(
+        xau_ohlc[["Open", "High", "Low"]].rename(
+            columns={"Open": "open_xau", "High": "high_xau", "Low": "low_xau"}
+        ),
+        how="left",
+    )
 
     df["x_ret1"] = np.log(df["xau"]).diff()
     df["x_ret3"] = np.log(df["xau"]).diff(3)
@@ -267,8 +272,6 @@ def make_features(
     if "us10y" in df.columns:
         df["us10y_chg1"] = df["us10y"].diff()
         df["us10y_chg5"] = df["us10y"].diff(5)
-
-        # FIXED: log spread instead of raw ratio
         df["gold_real_spread"] = np.log(df["xau"] / df["us10y"].replace(0, np.nan))
         df["gold_real_mom"] = df["gold_real_spread"].diff(5)
 
@@ -278,8 +281,6 @@ def make_features(
 
     if "spx" in df.columns:
         df["spx_ret5"] = np.log(df["spx"]).diff(5)
-
-        # FIXED: log spread instead of raw ratio
         df["gold_spx_spread"] = np.log(df["xau"] / df["spx"].replace(0, np.nan))
         df["gold_spx_mom"] = df["gold_spx_spread"].diff(5)
 
@@ -318,7 +319,14 @@ def make_features(
     df["lower_wick_body"] = (lower_wick / body.replace(0, np.nan)).replace([np.inf, -np.inf], np.nan)
 
     atr20_med = df["atr20"].rolling(SQUEEZE_LOOKBACK).median()
-    df["squeeze_on"] = ((df["atr14"] / atr20_med) < SQUEEZE_RATIO_MAX).astype(int)
+    df["atr_ratio"] = df["atr14"] / atr20_med
+    df["squeeze_on"] = (df["atr_ratio"] < SQUEEZE_RATIO_MAX).astype(int)
+
+    # NEW: volatility expansion after squeeze
+    df["vol_expansion"] = (
+        (df["atr_ratio"] > VOL_EXPANSION_RATIO_MIN) &
+        ((df["atr_ratio"] - df["atr_ratio"].shift(1)) > VOL_EXPANSION_MIN_DELTA)
+    ).astype(int)
 
     df["y"] = (df["xau"].shift(-1) > df["xau"]).astype(int)
 
@@ -336,14 +344,28 @@ def chart_filters(feats: pd.DataFrame, dt: pd.Timestamp, side: str) -> tuple[boo
         fake_breakout = np.isfinite(r["upper_wick_body"]) and float(r["upper_wick_body"]) > WICK_TO_BODY_FAKE
         wick_ok = (not np.isfinite(r["upper_wick_body"])) or float(r["upper_wick_body"]) <= WICK_TO_BODY_FAKE
         squeeze_bonus = int(r["squeeze_on"]) == 1
+        vol_expansion_bonus = int(r["vol_expansion"]) == 1
 
-        if structure_ok: score += 1
-        else: reasons.append("weak market structure")
-        if close_quality: score += 1
-        else: reasons.append("close not near high")
-        if wick_ok: score += 1
-        else: reasons.append("upper wick too large / fake breakout")
-        if squeeze_bonus: score += 1
+        if structure_ok:
+            score += 1
+        else:
+            reasons.append("weak market structure")
+
+        if close_quality:
+            score += 1
+        else:
+            reasons.append("close not near high")
+
+        if wick_ok:
+            score += 1
+        else:
+            reasons.append("upper wick too large / fake breakout")
+
+        if squeeze_bonus:
+            score += 1
+
+        if vol_expansion_bonus:
+            score += 1
 
         passed = structure_ok and close_quality and (not fake_breakout)
 
@@ -353,14 +375,28 @@ def chart_filters(feats: pd.DataFrame, dt: pd.Timestamp, side: str) -> tuple[boo
         fake_breakout = np.isfinite(r["lower_wick_body"]) and float(r["lower_wick_body"]) > WICK_TO_BODY_FAKE
         wick_ok = (not np.isfinite(r["lower_wick_body"])) or float(r["lower_wick_body"]) <= WICK_TO_BODY_FAKE
         squeeze_bonus = int(r["squeeze_on"]) == 1
+        vol_expansion_bonus = int(r["vol_expansion"]) == 1
 
-        if structure_ok: score += 1
-        else: reasons.append("weak market structure")
-        if close_quality: score += 1
-        else: reasons.append("close not near low")
-        if wick_ok: score += 1
-        else: reasons.append("lower wick too large / fake breakout")
-        if squeeze_bonus: score += 1
+        if structure_ok:
+            score += 1
+        else:
+            reasons.append("weak market structure")
+
+        if close_quality:
+            score += 1
+        else:
+            reasons.append("close not near low")
+
+        if wick_ok:
+            score += 1
+        else:
+            reasons.append("lower wick too large / fake breakout")
+
+        if squeeze_bonus:
+            score += 1
+
+        if vol_expansion_bonus:
+            score += 1
 
         passed = structure_ok and close_quality and (not fake_breakout)
 
@@ -693,7 +729,7 @@ def main():
         + f"P_adj: {p_up_adj:.4f} ({bias_reason})\n"
         + f"Trend(>MA50): {trend_txt}\n"
         + f"RiskGate: {risk_gate}\n"
-        + f"ChartScore: {chart_score}/4\n"
+        + f"ChartScore: {chart_score}/5\n"
         + f"Spread: {SPREAD_BPS} bps (±{SPREAD_BPS/2:.1f} bps)\n"
     )
     if real_available:
@@ -704,6 +740,8 @@ def main():
         info += f"GoldRealMom5: {float(feats.loc[last_day, 'gold_real_mom']):+.4f}\n"
     if "gold_spx_mom" in feats.columns:
         info += f"GoldSPXMom5: {float(feats.loc[last_day, 'gold_spx_mom']):+.4f}\n"
+    if "vol_expansion" in feats.columns:
+        info += f"VolExpansion: {int(feats.loc[last_day, 'vol_expansion'])}\n"
     if reason:
         info += f"Filter: {reason}\n"
 
