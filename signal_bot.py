@@ -95,7 +95,7 @@ def fetch_ohlc_stooq(symbol: str, retries: int = 3, sleep_s: float = 2.0) -> pd.
             if not needed.issubset(set(df.columns)):
                 raise RuntimeError(f"Missing columns: got={list(df.columns)[:20]}")
 
-            df["Date"] = pd.to_datetime(df["Date"])
+            df["Date"] = pd.to_datetime(df["Date"]).dt.normalize()
             df = df.sort_values("Date").set_index("Date")
             df = df[["Open", "High", "Low", "Close"]].dropna()
 
@@ -126,8 +126,10 @@ def fetch_ohlc_yahoo(symbol: str, retries: int = 3, sleep_s: float = 2.0) -> pd.
             ts = result["timestamp"]
             q = result["indicators"]["quote"][0]
 
+            dates = pd.to_datetime(ts, unit="s", utc=True).tz_convert(None).normalize()
+
             df = pd.DataFrame({
-                "Date": pd.to_datetime(ts, unit="s"),
+                "Date": dates,
                 "Open": q["open"],
                 "High": q["high"],
                 "Low": q["low"],
@@ -292,18 +294,33 @@ def make_features(
     tips_close: pd.Series | None,
     ief_close: pd.Series | None,
 ) -> pd.DataFrame:
+    xau_ohlc = xau_ohlc.copy()
+    xau_ohlc.index = pd.to_datetime(xau_ohlc.index).normalize()
+
     base = [xau_ohlc["Close"].rename("xau")]
     if dxy_close is not None:
+        dxy_close = dxy_close.copy()
+        dxy_close.index = pd.to_datetime(dxy_close.index).normalize()
         base.append(dxy_close.rename("dxy"))
     if us10y_close is not None:
+        us10y_close = us10y_close.copy()
+        us10y_close.index = pd.to_datetime(us10y_close.index).normalize()
         base.append(us10y_close.rename("us10y"))
     if vix_close is not None:
+        vix_close = vix_close.copy()
+        vix_close.index = pd.to_datetime(vix_close.index).normalize()
         base.append(vix_close.rename("vix"))
     if spx_close is not None:
+        spx_close = spx_close.copy()
+        spx_close.index = pd.to_datetime(spx_close.index).normalize()
         base.append(spx_close.rename("spx"))
     if tips_close is not None:
+        tips_close = tips_close.copy()
+        tips_close.index = pd.to_datetime(tips_close.index).normalize()
         base.append(tips_close.rename("tips"))
     if ief_close is not None:
+        ief_close = ief_close.copy()
+        ief_close.index = pd.to_datetime(ief_close.index).normalize()
         base.append(ief_close.rename("ief"))
 
     df = pd.concat(base, axis=1).dropna()
@@ -403,20 +420,16 @@ def chart_filters(feats: pd.DataFrame, dt: pd.Timestamp, side: str) -> tuple[boo
             score += 1
         else:
             reasons.append("weak market structure")
-
         if close_quality:
             score += 1
         else:
             reasons.append("close not near high")
-
         if wick_ok:
             score += 1
         else:
             reasons.append("upper wick too large / fake breakout")
-
         if squeeze_bonus:
             score += 1
-
         if vol_expansion_bonus:
             score += 1
 
@@ -434,20 +447,16 @@ def chart_filters(feats: pd.DataFrame, dt: pd.Timestamp, side: str) -> tuple[boo
             score += 1
         else:
             reasons.append("weak market structure")
-
         if close_quality:
             score += 1
         else:
             reasons.append("close not near low")
-
         if wick_ok:
             score += 1
         else:
             reasons.append("lower wick too large / fake breakout")
-
         if squeeze_bonus:
             score += 1
-
         if vol_expansion_bonus:
             score += 1
 
