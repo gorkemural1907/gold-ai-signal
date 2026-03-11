@@ -2,7 +2,7 @@ name: Gold AI Signal Bot
 
 on:
   schedule:
-    # Her gün 23:00 UTC (New York close sonrası)
+    # Her gün 23:00 UTC
     - cron: "0 23 * * *"
   workflow_dispatch:
 
