@@ -61,7 +61,7 @@ def save_state(state: dict) -> None:
     STATE_PATH.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
 
 # ============================================================
-# Stooq
+# Data fetch (Stooq + Yahoo fallback)
 # ============================================================
 SESSION = requests.Session()
 SESSION.headers.update({
@@ -73,7 +73,7 @@ FETCH_PAUSE_S = 0.6
 def stooq_url(symbol: str) -> str:
     return f"https://stooq.com/q/d/l/?s={symbol}&i=d"
 
-def fetch_ohlc_stooq(symbol: str, retries: int = 5, sleep_s: float = 2.0) -> pd.DataFrame:
+def fetch_ohlc_stooq(symbol: str, retries: int = 3, sleep_s: float = 2.0) -> pd.DataFrame:
     url = stooq_url(symbol)
     last_err = None
 
@@ -110,17 +110,71 @@ def fetch_ohlc_stooq(symbol: str, retries: int = 5, sleep_s: float = 2.0) -> pd.
 
     raise RuntimeError(f"Stooq fetch failed for {symbol}: {type(last_err).__name__}: {str(last_err)[:200]}")
 
-def fetch_optional(symbols: list[str], label: str) -> tuple[pd.DataFrame | None, str | None]:
-    for sym in symbols:
+def fetch_ohlc_yahoo(symbol: str, retries: int = 3, sleep_s: float = 2.0) -> pd.DataFrame:
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?range=10y&interval=1d&includePrePost=false"
+    last_err = None
+
+    for _ in range(retries):
         try:
-            return fetch_ohlc_stooq(sym), sym
+            time.sleep(FETCH_PAUSE_S)
+            resp = SESSION.get(url, timeout=25)
+            if resp.status_code != 200:
+                raise RuntimeError(f"HTTP {resp.status_code}")
+
+            data = resp.json()
+            result = data["chart"]["result"][0]
+            ts = result["timestamp"]
+            q = result["indicators"]["quote"][0]
+
+            df = pd.DataFrame({
+                "Date": pd.to_datetime(ts, unit="s"),
+                "Open": q["open"],
+                "High": q["high"],
+                "Low": q["low"],
+                "Close": q["close"],
+            })
+            df = df.dropna()
+            df = df.sort_values("Date").set_index("Date")
+
+            if len(df) < 300:
+                raise RuntimeError(f"Too few rows: {len(df)}")
+
+            return df[["Open", "High", "Low", "Close"]]
+
+        except Exception as e:
+            last_err = e
+            time.sleep(sleep_s)
+
+    raise RuntimeError(f"Yahoo fetch failed for {symbol}: {type(last_err).__name__}: {str(last_err)[:200]}")
+
+def fetch_ohlc(symbol: str, yahoo_symbol: str | None = None) -> pd.DataFrame:
+    try:
+        return fetch_ohlc_stooq(symbol)
+    except Exception as e:
+        msg = str(e).lower()
+        if yahoo_symbol and (
+            "quota exceeded" in msg
+            or "empty/short csv" in msg
+            or "http" in msg
+            or "missing columns" in msg
+        ):
+            return fetch_ohlc_yahoo(yahoo_symbol)
+        raise
+
+def fetch_optional(symbols: list[tuple[str, str | None]], label: str) -> tuple[pd.DataFrame | None, str | None]:
+    for stooq_sym, yahoo_sym in symbols:
+        try:
+            df = fetch_ohlc(stooq_sym, yahoo_sym)
+            used = stooq_sym if yahoo_sym is None else f"{stooq_sym}|{yahoo_sym}"
+            return df, used
         except Exception:
             pass
-    print(f"[WARN] {label} missing: {symbols}")
+    print(f"[WARN] {label} missing")
     return None, None
 
-def fetch_required_xau(symbol: str = "xauusd") -> pd.DataFrame:
-    df = fetch_ohlc_stooq(symbol)
+def fetch_required_xau() -> pd.DataFrame:
+    df = fetch_ohlc("xauusd", "XAUUSD=X")
+
     closes = df["Close"].astype(float).dropna()
     if len(closes) < 180:
         raise RuntimeError(f"XAU sanity needs more history: {len(closes)}")
@@ -146,13 +200,13 @@ def fetch_required_xau(symbol: str = "xauusd") -> pd.DataFrame:
 # ============================================================
 # Symbols
 # ============================================================
-XAU_SYMBOL = "xauusd"
-DXY_CANDIDATES = ["dx.f", "usd_i", "usdidx"]
-US10Y_CANDIDATES = ["10yusy.b", "us10y"]
-VIX_CANDIDATES = ["vi.f", "vix", "^vix", "vix.f"]
-SPX_CANDIDATES = ["^spx"]
-TIPS_CANDIDATES = ["tip.us"]
-IEF_CANDIDATES = ["ief.us"]
+XAU_SYMBOL = "xauusd|XAUUSD=X"
+DXY_CANDIDATES = [("dx.f", None), ("usd_i", "DX-Y.NYB"), ("usdidx", "DX-Y.NYB")]
+US10Y_CANDIDATES = [("10yusy.b", "^TNX"), ("us10y", "^TNX")]
+VIX_CANDIDATES = [("vi.f", "^VIX"), ("vix", "^VIX"), ("^vix", "^VIX"), ("vix.f", "^VIX")]
+SPX_CANDIDATES = [("^spx", "^GSPC")]
+TIPS_CANDIDATES = [("tip.us", "TIP")]
+IEF_CANDIDATES = [("ief.us", "IEF")]
 
 # ============================================================
 # Strategy config
@@ -193,8 +247,8 @@ CLOSE_NEAR_EXTREME_PCT = 0.30
 WICK_TO_BODY_FAKE = 1.2
 SQUEEZE_LOOKBACK = 20
 SQUEEZE_RATIO_MAX = 0.90
-VOL_EXPANSION_MIN_DELTA = 0.03   # atr_ratio today - yesterday
-VOL_EXPANSION_RATIO_MIN = 0.95   # atr14 / atr20 median üstüne toparlanma
+VOL_EXPANSION_MIN_DELTA = 0.03
+VOL_EXPANSION_RATIO_MIN = 0.95
 
 # management thresholds
 EXIT_P_ADJ_LONG = 0.52
@@ -322,7 +376,6 @@ def make_features(
     df["atr_ratio"] = df["atr14"] / atr20_med
     df["squeeze_on"] = (df["atr_ratio"] < SQUEEZE_RATIO_MAX).astype(int)
 
-    # NEW: volatility expansion after squeeze
     df["vol_expansion"] = (
         (df["atr_ratio"] > VOL_EXPANSION_RATIO_MIN) &
         ((df["atr_ratio"] - df["atr_ratio"].shift(1)) > VOL_EXPANSION_MIN_DELTA)
@@ -554,7 +607,7 @@ def evaluate_tracking(state: dict, xau_ohlc: pd.DataFrame, feats: pd.DataFrame |
 # ============================================================
 def main():
     state = load_state()
-    xau = fetch_required_xau(XAU_SYMBOL)
+    xau = fetch_required_xau()
 
     dxy, used_dxy = fetch_optional(DXY_CANDIDATES, "DXY")
     us10y, used_us10y = fetch_optional(US10Y_CANDIDATES, "US10Y")
