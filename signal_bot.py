@@ -66,7 +66,10 @@ def load_state() -> dict:
 
 def save_state(state: dict) -> None:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
-    STATE_PATH.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    STATE_PATH.write_text(
+        json.dumps(state, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
 
 
 # ============================================================
@@ -81,6 +84,7 @@ def normalize_ohlc_index(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df.index = pd.to_datetime(df.index).normalize()
     df = df.sort_index()
+    df = df[~df.index.duplicated(keep="last")]
     return df
 
 
@@ -111,6 +115,7 @@ def fetch_ohlc_stooq(symbol: str, retries: int = 3, sleep_s: float = 1.5) -> pd.
             df["Date"] = pd.to_datetime(df["Date"]).dt.normalize()
             df = df.sort_values("Date").set_index("Date")
             df = df[["Open", "High", "Low", "Close"]].dropna()
+            df = df[~df.index.duplicated(keep="last")]
 
             if len(df) < 200:
                 raise RuntimeError(f"Too few rows: {len(df)}")
@@ -157,6 +162,7 @@ def fetch_ohlc_yahoo(symbol: str, retries: int = 3, sleep_s: float = 1.5) -> pd.
 
             df = df.sort_values("Date").set_index("Date")
             df = df[["Open", "High", "Low", "Close"]]
+            df = df[~df.index.duplicated(keep="last")]
 
             if len(df) < 200:
                 raise RuntimeError(f"Too few rows: {len(df)}")
@@ -205,16 +211,18 @@ TIPS_PROVIDERS = [("stooq", "tip.us"), ("yahoo", "TIP")]
 IEF_PROVIDERS = [("stooq", "ief.us"), ("yahoo", "IEF")]
 
 # ============================================================
-# STRATEGY
+# STRATEGY CONFIG
 # ============================================================
 TRAIN_DAYS = 252 * 5
 
 TH_LONG = 0.62
 TH_SHORT = 0.38
 MIN_EDGE = 0.12
+
 REAL_BIAS = 0.015
 
 ATR_LEN = 14
+ATR_SLOW_LEN = 20
 STOP_ATR_MULT = 1.2
 RR = 2.0
 
@@ -229,6 +237,18 @@ LOT_STEP = 0.01
 SPREAD_BPS = 10
 SPREAD = SPREAD_BPS / 10000.0
 HALF_SPREAD = SPREAD / 2.0
+
+STRUCT_LOOKBACK = 5
+CLOSE_NEAR_EXTREME_PCT = 0.30
+WICK_TO_BODY_FAKE = 1.2
+SQUEEZE_LOOKBACK = 20
+SQUEEZE_RATIO_MAX = 0.90
+VOL_EXPANSION_MIN_DELTA = 0.03
+VOL_EXPANSION_RATIO_MIN = 0.95
+
+EXIT_P_ADJ_LONG = 0.52
+EXIT_P_ADJ_SHORT = 0.48
+
 
 # ============================================================
 # HELPERS
@@ -264,7 +284,7 @@ def lot_from_risk(stop_distance: float, risk_usd: float) -> float:
 # FEATURES
 # ============================================================
 def make_features(
-    xau: pd.DataFrame,
+    xau_ohlc: pd.DataFrame,
     dxy: pd.DataFrame | None,
     us10y: pd.DataFrame | None,
     vix: pd.DataFrame | None,
@@ -272,22 +292,33 @@ def make_features(
     tips: pd.DataFrame | None,
     ief: pd.DataFrame | None,
 ) -> pd.DataFrame:
-    series = [xau["Close"].rename("xau")]
+    xau_ohlc = normalize_ohlc_index(xau_ohlc)
+
+    series = [xau_ohlc["Close"].rename("xau")]
     if dxy is not None:
-        series.append(dxy["Close"].rename("dxy"))
+        series.append(normalize_ohlc_index(dxy)["Close"].rename("dxy"))
     if us10y is not None:
-        series.append(us10y["Close"].rename("us10y"))
+        series.append(normalize_ohlc_index(us10y)["Close"].rename("us10y"))
     if vix is not None:
-        series.append(vix["Close"].rename("vix"))
+        series.append(normalize_ohlc_index(vix)["Close"].rename("vix"))
     if spx is not None:
-        series.append(spx["Close"].rename("spx"))
+        series.append(normalize_ohlc_index(spx)["Close"].rename("spx"))
     if tips is not None:
-        series.append(tips["Close"].rename("tips"))
+        series.append(normalize_ohlc_index(tips)["Close"].rename("tips"))
     if ief is not None:
-        series.append(ief["Close"].rename("ief"))
+        series.append(normalize_ohlc_index(ief)["Close"].rename("ief"))
 
     df = pd.concat(series, axis=1).dropna()
-    print(f"[FEATS] aligned rows before feature engineering: {len(df)}")
+    df = df[~df.index.duplicated(keep="last")]
+    print(f"[FEATS] aligned rows before features: {len(df)}")
+
+    df = df.join(
+        xau_ohlc[["Open", "High", "Low"]].rename(
+            columns={"Open": "open_xau", "High": "high_xau", "Low": "low_xau"}
+        ),
+        how="left",
+    )
+    df = df[~df.index.duplicated(keep="last")]
 
     df["x_ret1"] = np.log(df["xau"]).diff()
     df["x_ret3"] = np.log(df["xau"]).diff(3)
@@ -316,17 +347,266 @@ def make_features(
         df["real_factor"] = np.log(df["tips"] / df["ief"])
         df["real_f_chg5"] = df["real_factor"].diff(5)
 
+    atr14 = compute_atr(xau_ohlc, ATR_LEN).rename("atr14")
+    atr20 = compute_atr(xau_ohlc, ATR_SLOW_LEN).rename("atr20")
+    df = df.join(atr14, how="left")
+    df = df.join(atr20, how="left")
+    df = df[~df.index.duplicated(keep="last")]
+
     df["ma50"] = df["xau"].rolling(50).mean()
     df["trend_up"] = (df["xau"] > df["ma50"]).astype(int)
 
-    atr14 = compute_atr(xau, ATR_LEN).rename("atr14")
-    df = df.join(atr14, how="left")
+    h = df["high_xau"]
+    l = df["low_xau"]
+    o = df["open_xau"]
+    c = df["xau"]
+
+    prev_high_max = h.shift(1).rolling(STRUCT_LOOKBACK).max()
+    prev_low_min = l.shift(1).rolling(STRUCT_LOOKBACK).min()
+
+    df["hh"] = (h > prev_high_max).astype(int)
+    df["hl"] = (l > prev_low_min).astype(int)
+    df["ll"] = (l < prev_low_min).astype(int)
+    df["lh"] = (h < prev_high_max).astype(int)
+
+    body = (c - o).abs()
+    rng = (h - l).replace(0, np.nan)
+    upper_wick = h - pd.concat([o, c], axis=1).max(axis=1)
+    lower_wick = pd.concat([o, c], axis=1).min(axis=1) - l
+
+    df["close_pos"] = ((c - l) / rng).clip(0, 1)
+    df["upper_wick_body"] = (upper_wick / body.replace(0, np.nan)).replace([np.inf, -np.inf], np.nan)
+    df["lower_wick_body"] = (lower_wick / body.replace(0, np.nan)).replace([np.inf, -np.inf], np.nan)
+
+    atr20_med = df["atr20"].rolling(SQUEEZE_LOOKBACK).median()
+    df["atr_ratio"] = df["atr14"] / atr20_med
+    df["squeeze_on"] = (df["atr_ratio"] < SQUEEZE_RATIO_MAX).astype(int)
+
+    df["vol_expansion"] = (
+        (df["atr_ratio"] > VOL_EXPANSION_RATIO_MIN) &
+        ((df["atr_ratio"] - df["atr_ratio"].shift(1)) > VOL_EXPANSION_MIN_DELTA)
+    ).astype(int)
 
     df["y"] = (df["xau"].shift(-1) > df["xau"]).astype(int)
 
     df = df.dropna()
-    print(f"[FEATS] rows after feature engineering: {len(df)}")
+    df = df[~df.index.duplicated(keep="last")]
+    print(f"[FEATS] rows after features: {len(df)}")
     return df
+
+
+def chart_filters(feats: pd.DataFrame, dt: pd.Timestamp, side: str) -> tuple[bool, str, int]:
+    r = feats.loc[dt]
+    score = 0
+    reasons = []
+
+    if side == "LONG":
+        structure_ok = (int(r["trend_up"]) == 1) and (int(r["hh"]) == 1 or int(r["hl"]) == 1)
+        close_quality = float(r["close_pos"]) >= (1.0 - CLOSE_NEAR_EXTREME_PCT)
+        fake_breakout = np.isfinite(r["upper_wick_body"]) and float(r["upper_wick_body"]) > WICK_TO_BODY_FAKE
+        wick_ok = (not np.isfinite(r["upper_wick_body"])) or float(r["upper_wick_body"]) <= WICK_TO_BODY_FAKE
+        squeeze_bonus = int(r["squeeze_on"]) == 1
+        vol_expansion_bonus = int(r["vol_expansion"]) == 1
+
+        if structure_ok:
+            score += 1
+        else:
+            reasons.append("weak market structure")
+        if close_quality:
+            score += 1
+        else:
+            reasons.append("close not near high")
+        if wick_ok:
+            score += 1
+        else:
+            reasons.append("upper wick too large / fake breakout")
+        if squeeze_bonus:
+            score += 1
+        if vol_expansion_bonus:
+            score += 1
+
+        passed = structure_ok and close_quality and (not fake_breakout)
+
+    else:
+        structure_ok = (int(r["trend_up"]) == 0) and (int(r["ll"]) == 1 or int(r["lh"]) == 1)
+        close_quality = float(r["close_pos"]) <= CLOSE_NEAR_EXTREME_PCT
+        fake_breakout = np.isfinite(r["lower_wick_body"]) and float(r["lower_wick_body"]) > WICK_TO_BODY_FAKE
+        wick_ok = (not np.isfinite(r["lower_wick_body"])) or float(r["lower_wick_body"]) <= WICK_TO_BODY_FAKE
+        squeeze_bonus = int(r["squeeze_on"]) == 1
+        vol_expansion_bonus = int(r["vol_expansion"]) == 1
+
+        if structure_ok:
+            score += 1
+        else:
+            reasons.append("weak market structure")
+        if close_quality:
+            score += 1
+        else:
+            reasons.append("close not near low")
+        if wick_ok:
+            score += 1
+        else:
+            reasons.append("lower wick too large / fake breakout")
+        if squeeze_bonus:
+            score += 1
+        if vol_expansion_bonus:
+            score += 1
+
+        passed = structure_ok and close_quality and (not fake_breakout)
+
+    reason = "ok" if passed else "; ".join(reasons[:3])
+    return passed, reason, score
+
+
+# ============================================================
+# TRACKING / MANAGEMENT
+# ============================================================
+def evaluate_tracking(
+    state: dict,
+    xau_ohlc: pd.DataFrame,
+    feats: pd.DataFrame | None = None,
+    p_up_adj: float | None = None,
+) -> tuple[dict, list[str]]:
+    msgs: list[str] = []
+    if len(xau_ohlc) < 3:
+        return state, msgs
+
+    last_bar_date = xau_ohlc.index[-1]
+    bar = xau_ohlc.iloc[-1]
+    h = float(bar["High"])
+    l = float(bar["Low"])
+    c = float(bar["Close"])
+
+    t = state.get("trade")
+    if not isinstance(t, dict):
+        return state, msgs
+
+    if t.get("last_processed_date") == str(last_bar_date.date()):
+        return state, msgs
+
+    status = t.get("status")
+    side = t.get("side")
+    entry = float(t.get("entry", 0) or 0)
+    sl = float(t.get("sl", 0) or 0)
+    tp = float(t.get("tp", 0) or 0)
+    valid_until = t.get("valid_until")
+    stop_dist = float(t.get("stop_dist", 0) or 0)
+
+    if status == "PENDING":
+        triggered = False
+        if side == "LONG" and h >= entry:
+            triggered = True
+        elif side == "SHORT" and l <= entry:
+            triggered = True
+
+        if triggered:
+            t["status"] = "OPEN"
+            t["open_date"] = str(last_bar_date.date())
+            t["be_moved"] = False
+            msgs.append(
+                "✅ TRADE TRIGGERED\n"
+                f"Date: {last_bar_date.date()}\n"
+                f"Side: {side}\n"
+                f"Entry: {entry:.2f}\n"
+                f"SL: {sl:.2f}\n"
+                f"TP: {tp:.2f}"
+            )
+        elif valid_until and str(last_bar_date.date()) >= valid_until:
+            t["status"] = "CANCELLED"
+            msgs.append(
+                "⏹️ SETUP CANCELLED\n"
+                f"Date: {last_bar_date.date()}\n"
+                f"Reason: Not triggered before next NY close\n"
+                f"Side: {side}\n"
+                f"Entry: {entry:.2f}"
+            )
+
+    if t.get("status") == "OPEN":
+        be_moved = bool(t.get("be_moved", False))
+        if (not be_moved) and stop_dist > 0:
+            if side == "LONG" and h >= entry + stop_dist:
+                t["sl"] = entry
+                t["be_moved"] = True
+                sl = entry
+                msgs.append(
+                    "🟦 MOVE STOP TO BREAK-EVEN\n"
+                    f"Date: {last_bar_date.date()}\n"
+                    f"Side: {side}\n"
+                    f"New SL: {entry:.2f}"
+                )
+            elif side == "SHORT" and l <= entry - stop_dist:
+                t["sl"] = entry
+                t["be_moved"] = True
+                sl = entry
+                msgs.append(
+                    "🟦 MOVE STOP TO BREAK-EVEN\n"
+                    f"Date: {last_bar_date.date()}\n"
+                    f"Side: {side}\n"
+                    f"New SL: {entry:.2f}"
+                )
+
+        if feats is not None and p_up_adj is not None and last_bar_date in feats.index:
+            chart_ok, chart_reason, _ = chart_filters(feats, last_bar_date, side)
+            exit_now = False
+            exit_reason = ""
+
+            if side == "LONG":
+                if p_up_adj < EXIT_P_ADJ_LONG:
+                    exit_now = True
+                    exit_reason = f"AI weakened (P_adj={p_up_adj:.4f})"
+                elif not chart_ok:
+                    exit_now = True
+                    exit_reason = f"Chart weakened ({chart_reason})"
+            elif side == "SHORT":
+                if p_up_adj > EXIT_P_ADJ_SHORT:
+                    exit_now = True
+                    exit_reason = f"AI weakened (P_adj={p_up_adj:.4f})"
+                elif not chart_ok:
+                    exit_now = True
+                    exit_reason = f"Chart weakened ({chart_reason})"
+
+            if exit_now:
+                t["status"] = "CLOSED"
+                t["result"] = "EXIT_NOW"
+                t["close_date"] = str(last_bar_date.date())
+                msgs.append(
+                    "🟨 EXIT NOW\n"
+                    f"Date: {last_bar_date.date()}\n"
+                    f"Side: {side}\n"
+                    f"Reason: {exit_reason}\n"
+                    f"Close: {c:.2f}"
+                )
+
+        if t.get("status") == "OPEN":
+            hit_sl = hit_tp = False
+            current_sl = float(t.get("sl", sl) or sl)
+            if side == "LONG":
+                hit_sl = l <= current_sl
+                hit_tp = h >= tp
+            elif side == "SHORT":
+                hit_sl = h >= current_sl
+                hit_tp = l <= tp
+
+            if hit_sl or hit_tp:
+                result = "STOP" if hit_sl else "TAKE_PROFIT"
+                if hit_sl and hit_tp:
+                    result = "STOP"
+                t["status"] = "CLOSED"
+                t["result"] = result
+                t["close_date"] = str(last_bar_date.date())
+
+                msgs.append(
+                    ("🟥 TRADE CLOSED (STOP)\n" if result == "STOP" else "🟩 TRADE CLOSED (TAKE PROFIT)\n")
+                    + f"Date: {last_bar_date.date()}\n"
+                    + f"Side: {side}\n"
+                    + f"Entry: {entry:.2f}\n"
+                    + f"SL: {current_sl:.2f}\n"
+                    + f"TP: {tp:.2f}"
+                )
+
+    t["last_processed_date"] = str(last_bar_date.date())
+    state["trade"] = t
+    return state, msgs
 
 
 # ============================================================
@@ -338,29 +618,38 @@ def main() -> None:
     xau, used_xau = fetch_ohlc_with_fallback("XAU", XAU_PROVIDERS)
     dxy, used_dxy = fetch_ohlc_with_fallback("DXY", DXY_PROVIDERS)
     us10y, used_us10y = fetch_ohlc_with_fallback("US10Y", US10Y_PROVIDERS)
-    vix, used_vix = fetch_ohlc_with_fallback("VIX", VIX_PROVIDERS)
     spx, used_spx = fetch_ohlc_with_fallback("SPX", SPX_PROVIDERS)
     tips, used_tips = fetch_ohlc_with_fallback("TIPS", TIPS_PROVIDERS)
     ief, used_ief = fetch_ohlc_with_fallback("IEF", IEF_PROVIDERS)
+
+    try:
+        vix, used_vix = fetch_ohlc_with_fallback("VIX", VIX_PROVIDERS)
+        print("[RISK] using VIX")
+    except Exception as e:
+        print("[WARN] VIX unavailable:", str(e)[:300])
+        vix, used_vix = None, None
 
     feats = make_features(xau, dxy, us10y, vix, spx, tips, ief)
 
     if len(feats) < TRAIN_DAYS + 10:
         raise RuntimeError(f"Not enough aligned rows: {len(feats)} need~{TRAIN_DAYS}")
 
-    feature_cols = ["x_ret1", "x_ret3", "x_ret5", "trend_up"]
-
-    for col in [
-        "dxy_ret1", "dxy_ret5",
-        "us10y_chg1", "us10y_chg5",
-        "gold_real_mom",
-        "vix_ret1", "vix_ret5",
-        "spx_ret5",
-        "gold_spx_mom",
-        "real_f_chg5",
-    ]:
-        if col in feats.columns:
-            feature_cols.append(col)
+    feature_cols = ["x_ret1", "x_ret3", "x_ret5"]
+    if "dxy_ret1" in feats.columns and "dxy_ret5" in feats.columns:
+        feature_cols += ["dxy_ret1", "dxy_ret5"]
+    if "us10y_chg1" in feats.columns and "us10y_chg5" in feats.columns:
+        feature_cols += ["us10y_chg1", "us10y_chg5"]
+    if "gold_real_mom" in feats.columns:
+        feature_cols += ["gold_real_mom"]
+    if "vix_ret1" in feats.columns and "vix_ret5" in feats.columns:
+        feature_cols += ["vix_ret1", "vix_ret5"]
+    if "spx_ret5" in feats.columns:
+        feature_cols += ["spx_ret5"]
+    if "gold_spx_mom" in feats.columns:
+        feature_cols += ["gold_spx_mom"]
+    if "real_f_chg5" in feats.columns:
+        feature_cols += ["real_f_chg5"]
+    feature_cols += ["trend_up"]
 
     print("[MODEL] feature cols:", feature_cols)
 
@@ -368,8 +657,8 @@ def main() -> None:
     y = feats["y"].astype(int)
 
     last_day = feats.index[-1]
-    X_train = X.iloc[-TRAIN_DAYS-1:-1]
-    y_train = y.iloc[-TRAIN_DAYS-1:-1]
+    X_train = X.iloc[-TRAIN_DAYS - 1:-1]
+    y_train = y.iloc[-TRAIN_DAYS - 1:-1]
     X_last = X.loc[[last_day]]
 
     print(f"[MODEL] train rows={len(X_train)} infer_date={last_day.date()}")
@@ -382,7 +671,9 @@ def main() -> None:
 
     p_up = float(model.predict_proba(X_last)[:, 1][0])
 
-    real_chg5 = float(feats.loc[last_day, "real_f_chg5"]) if "real_f_chg5" in feats.columns else float("nan")
+    real_available = "real_f_chg5" in feats.columns
+    real_chg5 = float(feats.loc[last_day, "real_f_chg5"]) if real_available else float("nan")
+
     bias = 0.0
     bias_reason = "RealBias: N/A"
     if np.isfinite(real_chg5):
@@ -397,6 +688,15 @@ def main() -> None:
 
     p_adj = clamp01(p_up + bias)
 
+    state, track_msgs = evaluate_tracking(state, xau, feats=feats, p_up_adj=p_adj)
+    for m in track_msgs:
+        send_telegram(m)
+
+    trade = state.get("trade", {})
+    if trade.get("status") in ("PENDING", "OPEN"):
+        save_state(state)
+        return
+
     trend_up = int(feats.loc[last_day, "trend_up"]) == 1
     trend_txt = "UP" if trend_up else "DOWN"
 
@@ -405,6 +705,13 @@ def main() -> None:
         side = "LONG"
     elif (p_adj < TH_SHORT) and ((0.5 - p_adj) >= MIN_EDGE) and (not trend_up):
         side = "SHORT"
+
+    chart_score = 0
+    chart_reason = ""
+    if side in ("LONG", "SHORT"):
+        chart_ok, chart_reason, chart_score = chart_filters(feats, last_day, side)
+        if not chart_ok:
+            side = "NO-TRADE"
 
     atr = float(feats.loc[last_day, "atr14"])
     ybar = xau.iloc[-2]
@@ -436,6 +743,8 @@ def main() -> None:
         skip_reason = f"Risk too large for account. Min lot risk=${real_risk_usd:.2f} > max ${MAX_RISK_USD:.2f}"
         lot = MIN_LOT
 
+    risk_gate = "VIX" if used_vix is not None else "SPX_PROXY"
+
     msg = (
         f"GOLD AI SIGNAL (XAUUSD)\n\n"
         f"Date: {last_day.date()}\n\n"
@@ -443,14 +752,30 @@ def main() -> None:
         f"XAU: {used_xau}\n"
         f"DXY: {used_dxy}\n"
         f"US10Y: {used_us10y}\n"
-        f"VIX: {used_vix}\n"
+        f"VIX: {used_vix if used_vix is not None else 'NONE'}\n"
         f"SPX: {used_spx}\n"
         f"TIPS: {used_tips}\n"
         f"IEF: {used_ief}\n\n"
         f"P(up): {p_up:.4f}\n"
         f"P_adj: {p_adj:.4f} ({bias_reason})\n"
-        f"Trend(>MA50): {trend_txt}\n\n"
-        f"Signal: {side}\n\n"
+        f"Trend(>MA50): {trend_txt}\n"
+        f"RiskGate: {risk_gate}\n"
+        f"ChartScore: {chart_score}/5\n"
+    )
+
+    if real_available:
+        msg += f"RealFactor chg5: {real_chg5:+.4f}\n"
+    if "gold_real_mom" in feats.columns:
+        msg += f"GoldRealMom5: {float(feats.loc[last_day, 'gold_real_mom']):+.4f}\n"
+    if "gold_spx_mom" in feats.columns:
+        msg += f"GoldSPXMom5: {float(feats.loc[last_day, 'gold_spx_mom']):+.4f}\n"
+    if "vol_expansion" in feats.columns:
+        msg += f"VolExpansion: {int(feats.loc[last_day, 'vol_expansion'])}\n"
+    if chart_reason:
+        msg += f"ChartFilter: {chart_reason}\n"
+
+    msg += (
+        f"\nSignal: {side}\n\n"
         f"Breakout Entry: {entry:.2f}\n"
         f"Yesterday High: {y_high:.2f}\n"
         f"Yesterday Low: {y_low:.2f}\n"
@@ -461,11 +786,6 @@ def main() -> None:
         f"Suggested lot: {lot:.2f}\n"
     )
 
-    if "gold_real_mom" in feats.columns:
-        msg += f"GoldRealMom5: {float(feats.loc[last_day, 'gold_real_mom']):+.4f}\n"
-    if "gold_spx_mom" in feats.columns:
-        msg += f"GoldSPXMom5: {float(feats.loc[last_day, 'gold_spx_mom']):+.4f}\n"
-
     if trade_skipped:
         msg += f"\nTrade: SKIPPED\nReason: {skip_reason}\n"
 
@@ -473,6 +793,21 @@ def main() -> None:
 
     if side != "NO-TRADE" or SEND_NO_TRADE:
         send_telegram(msg)
+
+    if side in ("LONG", "SHORT") and not trade_skipped:
+        state["trade"] = {
+            "status": "PENDING",
+            "created_date": str(last_day.date()),
+            "valid_until": str(last_day.date()),
+            "side": side,
+            "entry": float(entry),
+            "sl": float(sl),
+            "tp": float(tp),
+            "lot": float(lot),
+            "stop_dist": float(stop_dist),
+            "be_moved": False,
+            "last_processed_date": state.get("trade", {}).get("last_processed_date"),
+        }
 
     save_state(state)
 
