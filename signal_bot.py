@@ -215,9 +215,10 @@ IEF_PROVIDERS = [("stooq", "ief.us"), ("yahoo", "IEF")]
 # ============================================================
 TRAIN_DAYS = 252 * 5
 
-TH_LONG = 0.62
-TH_SHORT = 0.38
-MIN_EDGE = 0.12
+# softer thresholds
+TH_LONG = 0.58
+TH_SHORT = 0.42
+MIN_EDGE = 0.08
 
 REAL_BIAS = 0.015
 
@@ -239,15 +240,18 @@ SPREAD = SPREAD_BPS / 10000.0
 HALF_SPREAD = SPREAD / 2.0
 
 STRUCT_LOOKBACK = 5
-CLOSE_NEAR_EXTREME_PCT = 0.30
-WICK_TO_BODY_FAKE = 1.2
+CLOSE_NEAR_EXTREME_PCT = 0.40
+WICK_TO_BODY_FAKE = 1.8
 SQUEEZE_LOOKBACK = 20
 SQUEEZE_RATIO_MAX = 0.90
-VOL_EXPANSION_MIN_DELTA = 0.03
-VOL_EXPANSION_RATIO_MIN = 0.95
+VOL_EXPANSION_MIN_DELTA = 0.02
+VOL_EXPANSION_RATIO_MIN = 0.92
 
-EXIT_P_ADJ_LONG = 0.52
-EXIT_P_ADJ_SHORT = 0.48
+# chart gating softened
+MIN_CHART_SCORE_TO_TRADE = 2
+
+EXIT_P_ADJ_LONG = 0.50
+EXIT_P_ADJ_SHORT = 0.50
 
 
 # ============================================================
@@ -425,7 +429,8 @@ def chart_filters(feats: pd.DataFrame, dt: pd.Timestamp, side: str) -> tuple[boo
         if vol_expansion_bonus:
             score += 1
 
-        passed = structure_ok and close_quality and (not fake_breakout)
+        # soft pass
+        passed = (score >= MIN_CHART_SCORE_TO_TRADE) and (not fake_breakout)
 
     else:
         structure_ok = (int(r["trend_up"]) == 0) and (int(r["ll"]) == 1 or int(r["lh"]) == 1)
@@ -452,9 +457,9 @@ def chart_filters(feats: pd.DataFrame, dt: pd.Timestamp, side: str) -> tuple[boo
         if vol_expansion_bonus:
             score += 1
 
-        passed = structure_ok and close_quality and (not fake_breakout)
+        passed = (score >= MIN_CHART_SCORE_TO_TRADE) and (not fake_breakout)
 
-    reason = "ok" if passed else "; ".join(reasons[:3])
+    reason = "ok" if passed else "; ".join(reasons[:3]) if reasons else "score too low"
     return passed, reason, score
 
 
@@ -527,7 +532,6 @@ def evaluate_tracking(
             if side == "LONG" and h >= entry + stop_dist:
                 t["sl"] = entry
                 t["be_moved"] = True
-                sl = entry
                 msgs.append(
                     "🟦 MOVE STOP TO BREAK-EVEN\n"
                     f"Date: {last_bar_date.date()}\n"
@@ -537,7 +541,6 @@ def evaluate_tracking(
             elif side == "SHORT" and l <= entry - stop_dist:
                 t["sl"] = entry
                 t["be_moved"] = True
-                sl = entry
                 msgs.append(
                     "🟦 MOVE STOP TO BREAK-EVEN\n"
                     f"Date: {last_bar_date.date()}\n"
@@ -546,7 +549,7 @@ def evaluate_tracking(
                 )
 
         if feats is not None and p_up_adj is not None and last_bar_date in feats.index:
-            chart_ok, chart_reason, _ = chart_filters(feats, last_bar_date, side)
+            chart_ok, chart_reason, chart_score = chart_filters(feats, last_bar_date, side)
             exit_now = False
             exit_reason = ""
 
@@ -554,14 +557,14 @@ def evaluate_tracking(
                 if p_up_adj < EXIT_P_ADJ_LONG:
                     exit_now = True
                     exit_reason = f"AI weakened (P_adj={p_up_adj:.4f})"
-                elif not chart_ok:
+                elif chart_score < 1:
                     exit_now = True
                     exit_reason = f"Chart weakened ({chart_reason})"
             elif side == "SHORT":
                 if p_up_adj > EXIT_P_ADJ_SHORT:
                     exit_now = True
                     exit_reason = f"AI weakened (P_adj={p_up_adj:.4f})"
-                elif not chart_ok:
+                elif chart_score < 1:
                     exit_now = True
                     exit_reason = f"Chart weakened ({chart_reason})"
 
@@ -578,12 +581,12 @@ def evaluate_tracking(
                 )
 
         if t.get("status") == "OPEN":
-            hit_sl = hit_tp = False
             current_sl = float(t.get("sl", sl) or sl)
+
             if side == "LONG":
                 hit_sl = l <= current_sl
                 hit_tp = h >= tp
-            elif side == "SHORT":
+            else:
                 hit_sl = h >= current_sl
                 hit_tp = l <= tp
 
@@ -591,6 +594,7 @@ def evaluate_tracking(
                 result = "STOP" if hit_sl else "TAKE_PROFIT"
                 if hit_sl and hit_tp:
                     result = "STOP"
+
                 t["status"] = "CLOSED"
                 t["result"] = result
                 t["close_date"] = str(last_bar_date.date())
