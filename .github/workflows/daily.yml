@@ -9,18 +9,20 @@ on:
 jobs:
   run-bot:
     runs-on: ubuntu-latest
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Setup Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.11"
 
       - name: Restore bot state
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v5
         with:
           path: .bot_state
           key: gold-ai-bot-state
@@ -39,7 +41,7 @@ jobs:
 
       - name: Save bot state
         if: always()
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v5
         with:
           path: .bot_state
           key: gold-ai-bot-state
