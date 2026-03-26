@@ -215,7 +215,6 @@ IEF_PROVIDERS = [("stooq", "ief.us"), ("yahoo", "IEF")]
 # ============================================================
 TRAIN_DAYS = 252 * 5
 
-# softer thresholds
 TH_LONG = 0.58
 TH_SHORT = 0.42
 MIN_EDGE = 0.08
@@ -247,11 +246,24 @@ SQUEEZE_RATIO_MAX = 0.90
 VOL_EXPANSION_MIN_DELTA = 0.02
 VOL_EXPANSION_RATIO_MIN = 0.92
 
-# chart gating softened
 MIN_CHART_SCORE_TO_TRADE = 2
 
 EXIT_P_ADJ_LONG = 0.50
 EXIT_P_ADJ_SHORT = 0.50
+
+# ============================================================
+# ENTRY UPGRADE: LATE FILTER + RETEST
+# ============================================================
+ENTRY_MODE = "RETEST"   # "BREAKOUT" or "RETEST"
+
+# Son kapanış breakout level'dan ATR'nin bu oranından fazla uzaksa trade alma
+LATE_ENTRY_ATR_FRACTION = 0.25
+
+# Retest toleransı
+RETEST_TOL_PCT = 0.0010   # %0.10
+
+# Retest rejection close buffer
+RETEST_REJECTION_BUFFER_PCT = 0.0003   # %0.03
 
 
 # ============================================================
@@ -282,6 +294,56 @@ def lot_from_risk(stop_distance: float, risk_usd: float) -> float:
     if stop_distance <= 0:
         return 0.0
     return risk_usd / (stop_distance * LOT_OZ)
+
+
+def late_entry_filter(
+    side: str,
+    close_price: float,
+    breakout_level: float,
+    atr: float,
+) -> tuple[bool, str, float]:
+    if atr <= 0 or not np.isfinite(atr):
+        return False, "", 0.0
+
+    if side == "LONG":
+        move = max(0.0, close_price - breakout_level)
+    elif side == "SHORT":
+        move = max(0.0, breakout_level - close_price)
+    else:
+        return False, "", 0.0
+
+    limit = LATE_ENTRY_ATR_FRACTION * atr
+    is_late = move > limit
+    reason = (
+        f"late entry: move {move:.2f} > {LATE_ENTRY_ATR_FRACTION:.2f}*ATR ({limit:.2f})"
+        if is_late else ""
+    )
+    return is_late, reason, move
+
+
+def build_trade_setup(
+    side: str,
+    y_high: float,
+    y_low: float,
+    atr: float,
+) -> tuple[float, float, float, float]:
+    if side == "LONG":
+        break_level = y_high
+        entry = y_high * (1.0 + HALF_SPREAD)
+        sl = entry - STOP_ATR_MULT * atr
+        tp = entry + RR * (STOP_ATR_MULT * atr)
+    elif side == "SHORT":
+        break_level = y_low
+        entry = y_low * (1.0 - HALF_SPREAD)
+        sl = entry + STOP_ATR_MULT * atr
+        tp = entry - RR * (STOP_ATR_MULT * atr)
+    else:
+        break_level = float("nan")
+        entry = float("nan")
+        sl = float("nan")
+        tp = float("nan")
+
+    return entry, sl, tp, break_level
 
 
 # ============================================================
@@ -429,7 +491,6 @@ def chart_filters(feats: pd.DataFrame, dt: pd.Timestamp, side: str) -> tuple[boo
         if vol_expansion_bonus:
             score += 1
 
-        # soft pass
         passed = (score >= MIN_CHART_SCORE_TO_TRADE) and (not fake_breakout)
 
     else:
@@ -496,13 +557,37 @@ def evaluate_tracking(
     tp = float(t.get("tp", 0) or 0)
     valid_until = t.get("valid_until")
     stop_dist = float(t.get("stop_dist", 0) or 0)
+    break_level = float(t.get("break_level", 0) or 0)
+    entry_mode = str(t.get("entry_mode", "BREAKOUT") or "BREAKOUT")
 
     if status == "PENDING":
         triggered = False
-        if side == "LONG" and h >= entry:
-            triggered = True
-        elif side == "SHORT" and l <= entry:
-            triggered = True
+        trigger_reason = ""
+
+        if entry_mode == "BREAKOUT":
+            if side == "LONG" and h >= entry:
+                triggered = True
+                trigger_reason = "breakout touched entry"
+            elif side == "SHORT" and l <= entry:
+                triggered = True
+                trigger_reason = "breakout touched entry"
+
+        elif entry_mode == "RETEST":
+            if side == "LONG":
+                near_level = l <= break_level * (1.0 + RETEST_TOL_PCT)
+                rejection_ok = c >= break_level * (1.0 + RETEST_REJECTION_BUFFER_PCT)
+                touched_entry = h >= entry
+                if near_level and rejection_ok and touched_entry:
+                    triggered = True
+                    trigger_reason = "retest + bullish rejection"
+
+            elif side == "SHORT":
+                near_level = h >= break_level * (1.0 - RETEST_TOL_PCT)
+                rejection_ok = c <= break_level * (1.0 - RETEST_REJECTION_BUFFER_PCT)
+                touched_entry = l <= entry
+                if near_level and rejection_ok and touched_entry:
+                    triggered = True
+                    trigger_reason = "retest + bearish rejection"
 
         if triggered:
             t["status"] = "OPEN"
@@ -512,6 +597,8 @@ def evaluate_tracking(
                 "✅ TRADE TRIGGERED\n"
                 f"Date: {last_bar_date.date()}\n"
                 f"Side: {side}\n"
+                f"Mode: {entry_mode}\n"
+                f"Trigger: {trigger_reason}\n"
                 f"Entry: {entry:.2f}\n"
                 f"SL: {sl:.2f}\n"
                 f"TP: {tp:.2f}"
@@ -523,6 +610,7 @@ def evaluate_tracking(
                 f"Date: {last_bar_date.date()}\n"
                 f"Reason: Not triggered before next NY close\n"
                 f"Side: {side}\n"
+                f"Mode: {entry_mode}\n"
                 f"Entry: {entry:.2f}"
             )
 
@@ -721,19 +809,28 @@ def main() -> None:
     ybar = xau.iloc[-2]
     y_high = float(ybar["High"])
     y_low = float(ybar["Low"])
+    close_now = float(xau["Close"].iloc[-1])
+
+    late_filter_reason = ""
+    late_move = 0.0
 
     if side == "LONG":
-        entry = y_high * (1.0 + HALF_SPREAD)
-        sl = entry - STOP_ATR_MULT * atr
-        tp = entry + RR * (STOP_ATR_MULT * atr)
+        entry, sl, tp, break_level = build_trade_setup("LONG", y_high, y_low, atr)
+        is_late, late_filter_reason, late_move = late_entry_filter("LONG", close_now, y_high, atr)
+        if is_late:
+            side = "NO-TRADE"
+
     elif side == "SHORT":
-        entry = y_low * (1.0 - HALF_SPREAD)
-        sl = entry + STOP_ATR_MULT * atr
-        tp = entry - RR * (STOP_ATR_MULT * atr)
+        entry, sl, tp, break_level = build_trade_setup("SHORT", y_high, y_low, atr)
+        is_late, late_filter_reason, late_move = late_entry_filter("SHORT", close_now, y_low, atr)
+        if is_late:
+            side = "NO-TRADE"
+
     else:
-        entry = float(xau["Close"].iloc[-1])
+        entry = float(close_now)
         sl = float("nan")
         tp = float("nan")
+        break_level = float("nan")
 
     stop_dist = STOP_ATR_MULT * atr
     lot_raw = lot_from_risk(stop_dist, MAX_RISK_USD)
@@ -765,6 +862,7 @@ def main() -> None:
         f"Trend(>MA50): {trend_txt}\n"
         f"RiskGate: {risk_gate}\n"
         f"ChartScore: {chart_score}/5\n"
+        f"EntryMode: {ENTRY_MODE}\n"
     )
 
     if real_available:
@@ -777,12 +875,17 @@ def main() -> None:
         msg += f"VolExpansion: {int(feats.loc[last_day, 'vol_expansion'])}\n"
     if chart_reason:
         msg += f"ChartFilter: {chart_reason}\n"
+    if late_filter_reason:
+        msg += f"LateFilter: {late_filter_reason}\n"
 
     msg += (
         f"\nSignal: {side}\n\n"
         f"Breakout Entry: {entry:.2f}\n"
+        f"BreakLevel: {break_level:.2f}\n"
         f"Yesterday High: {y_high:.2f}\n"
         f"Yesterday Low: {y_low:.2f}\n"
+        f"Close Now: {close_now:.2f}\n"
+        f"LateMove: {late_move:.2f}\n"
         f"Stop Loss: {sl:.2f}\n"
         f"Take Profit: {tp:.2f}\n"
         f"ATR({ATR_LEN}): {atr:.2f}\n"
@@ -804,7 +907,9 @@ def main() -> None:
             "created_date": str(last_day.date()),
             "valid_until": str(last_day.date()),
             "side": side,
+            "entry_mode": ENTRY_MODE,
             "entry": float(entry),
+            "break_level": float(break_level),
             "sl": float(sl),
             "tp": float(tp),
             "lot": float(lot),
