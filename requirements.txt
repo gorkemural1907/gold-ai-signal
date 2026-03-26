@@ -1,4 +1,4 @@
-pandas
-numpy
-scikit-learn
-requests
+pandas~=3.0
+numpy~=2.4
+scikit-learn~=1.8
+requests~=2.32
