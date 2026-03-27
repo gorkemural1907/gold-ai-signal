@@ -55,13 +55,38 @@ STATE_DIR = Path(".bot_state")
 STATE_PATH = STATE_DIR / "state.json"
 
 
+def default_state() -> dict:
+    return {
+        "trade": {},
+        "journal": [],
+        "stats": {
+            "total": 0,
+            "wins": 0,
+            "losses": 0,
+            "breakeven": 0,
+            "exit_now": 0,
+            "cancelled": 0,
+            "sum_r": 0.0,
+            "avg_r": 0.0,
+            "winrate": 0.0,
+            "expectancy_r": 0.0,
+        },
+    }
+
+
 def load_state() -> dict:
     if STATE_PATH.exists():
         try:
-            return json.loads(STATE_PATH.read_text(encoding="utf-8"))
+            state = json.loads(STATE_PATH.read_text(encoding="utf-8"))
+            if not isinstance(state, dict):
+                return default_state()
+            state.setdefault("trade", {})
+            state.setdefault("journal", [])
+            state.setdefault("stats", default_state()["stats"])
+            return state
         except Exception:
-            return {}
-    return {}
+            return default_state()
+    return default_state()
 
 
 def save_state(state: dict) -> None:
@@ -245,26 +270,24 @@ SQUEEZE_LOOKBACK = 20
 SQUEEZE_RATIO_MAX = 0.90
 VOL_EXPANSION_MIN_DELTA = 0.02
 VOL_EXPANSION_RATIO_MIN = 0.92
-
 MIN_CHART_SCORE_TO_TRADE = 2
 
 EXIT_P_ADJ_LONG = 0.50
 EXIT_P_ADJ_SHORT = 0.50
 
 # ============================================================
-# ENTRY UPGRADE: LATE FILTER + RETEST
+# ENTRY UPGRADE
 # ============================================================
 ENTRY_MODE = "RETEST"   # "BREAKOUT" or "RETEST"
 
-# Son kapanış breakout level'dan ATR'nin bu oranından fazla uzaksa trade alma
 LATE_ENTRY_ATR_FRACTION = 0.25
+RETEST_TOL_PCT = 0.0010
+RETEST_REJECTION_BUFFER_PCT = 0.0003
 
-# Retest toleransı
-RETEST_TOL_PCT = 0.0010   # %0.10
-
-# Retest rejection close buffer
-RETEST_REJECTION_BUFFER_PCT = 0.0003   # %0.03
-
+# Yeni: bounce / rejection kalitesi
+MIN_REJECTION_BODY_PCT = 0.0015      # %0.15
+MIN_BOUNCE_FROM_LEVEL_ATR = 0.10     # en az 0.10 ATR rejection
+MAX_CLOSE_AWAY_FROM_LEVEL_ATR = 0.35 # close çok uzak kaçtıysa chase say
 
 # ============================================================
 # HELPERS
@@ -346,6 +369,192 @@ def build_trade_setup(
     return entry, sl, tp, break_level
 
 
+def calc_mfe_mae(side: str, entry: float, high: float, low: float) -> tuple[float, float]:
+    if side == "SHORT":
+        mfe = max(0.0, entry - low)
+        mae = max(0.0, high - entry)
+    else:
+        mfe = max(0.0, high - entry)
+        mae = max(0.0, entry - low)
+    return mfe, mae
+
+
+def update_running_extremes(trade: dict, side: str, high: float, low: float, entry: float) -> dict:
+    mfe_today, mae_today = calc_mfe_mae(side, entry, high, low)
+    trade["max_favorable"] = max(float(trade.get("max_favorable", 0.0) or 0.0), mfe_today)
+    trade["max_adverse"] = max(float(trade.get("max_adverse", 0.0) or 0.0), mae_today)
+    return trade
+
+
+def compute_r_result(result: str, entry: float, stop_dist: float, close_price: float | None = None) -> float:
+    if stop_dist <= 0:
+        return 0.0
+    if result == "TAKE_PROFIT":
+        return RR
+    if result == "STOP":
+        return -1.0
+    if result == "BREAKEVEN":
+        return 0.0
+    if result == "CANCELLED":
+        return 0.0
+    if result == "EXIT_NOW" and close_price is not None:
+        return (close_price - entry) / stop_dist
+    return 0.0
+
+
+def refresh_stats(state: dict) -> None:
+    journal = state.get("journal", [])
+    total = 0
+    wins = 0
+    losses = 0
+    breakeven = 0
+    exit_now = 0
+    cancelled = 0
+    sum_r = 0.0
+
+    for j in journal:
+        result = j.get("result")
+        r_mult = float(j.get("r_mult", 0.0) or 0.0)
+
+        if result == "TAKE_PROFIT":
+            wins += 1
+            total += 1
+            sum_r += r_mult
+        elif result == "STOP":
+            losses += 1
+            total += 1
+            sum_r += r_mult
+        elif result == "BREAKEVEN":
+            breakeven += 1
+            total += 1
+            sum_r += r_mult
+        elif result == "EXIT_NOW":
+            exit_now += 1
+            total += 1
+            sum_r += r_mult
+        elif result == "CANCELLED":
+            cancelled += 1
+
+    avg_r = (sum_r / total) if total > 0 else 0.0
+    winrate = (wins / total * 100.0) if total > 0 else 0.0
+
+    state["stats"] = {
+        "total": total,
+        "wins": wins,
+        "losses": losses,
+        "breakeven": breakeven,
+        "exit_now": exit_now,
+        "cancelled": cancelled,
+        "sum_r": round(sum_r, 4),
+        "avg_r": round(avg_r, 4),
+        "winrate": round(winrate, 2),
+        "expectancy_r": round(avg_r, 4),
+    }
+
+
+def add_journal_entry(
+    state: dict,
+    trade: dict,
+    result: str,
+    close_date: str,
+    close_price: float | None = None,
+) -> None:
+    journal = state.setdefault("journal", [])
+
+    entry = float(trade.get("entry", 0.0) or 0.0)
+    stop_dist = float(trade.get("stop_dist", 0.0) or 0.0)
+    r_mult = compute_r_result(result, entry, stop_dist, close_price)
+
+    row = {
+        "created_date": trade.get("created_date"),
+        "open_date": trade.get("open_date"),
+        "close_date": close_date,
+        "side": trade.get("side"),
+        "entry_mode": trade.get("entry_mode"),
+        "entry": round(entry, 4),
+        "sl": round(float(trade.get("sl_initial", trade.get("sl", 0.0)) or 0.0), 4),
+        "tp": round(float(trade.get("tp", 0.0) or 0.0), 4),
+        "stop_dist": round(stop_dist, 4),
+        "result": result,
+        "close_price": round(float(close_price), 4) if close_price is not None else None,
+        "r_mult": round(r_mult, 4),
+        "max_favorable": round(float(trade.get("max_favorable", 0.0) or 0.0), 4),
+        "max_adverse": round(float(trade.get("max_adverse", 0.0) or 0.0), 4),
+    }
+
+    journal.append(row)
+    state["journal"] = journal[-500:]
+    refresh_stats(state)
+
+
+def stats_text(state: dict) -> str:
+    s = state.get("stats", {})
+    return (
+        f"Trades: {s.get('total', 0)}\n"
+        f"Wins: {s.get('wins', 0)} | Losses: {s.get('losses', 0)} | BE: {s.get('breakeven', 0)} | ExitNow: {s.get('exit_now', 0)}\n"
+        f"WinRate: {float(s.get('winrate', 0.0)):.2f}%\n"
+        f"Avg R: {float(s.get('avg_r', 0.0)):.2f}\n"
+        f"Expectancy: {float(s.get('expectancy_r', 0.0)):.2f}R"
+    }
+
+
+def rejection_filter(
+    side: str,
+    o: float,
+    h: float,
+    l: float,
+    c: float,
+    break_level: float,
+    atr: float,
+) -> tuple[bool, str]:
+    """
+    Gecikmiş breakdown chase'i azaltmak için:
+    - level'e yakın temas
+    - rejection yönlü close
+    - yeterli body / bounce
+    - close levelden aşırı uzak değil
+    """
+    if atr <= 0 or not np.isfinite(atr):
+        return False, "invalid ATR"
+
+    body_abs = abs(c - o)
+    min_body_abs = MIN_REJECTION_BODY_PCT * break_level
+    max_close_away = MAX_CLOSE_AWAY_FROM_LEVEL_ATR * atr
+    min_bounce_abs = MIN_BOUNCE_FROM_LEVEL_ATR * atr
+
+    if side == "SHORT":
+        touched = h >= break_level * (1.0 - RETEST_TOL_PCT)
+        bearish_close = c <= break_level * (1.0 - RETEST_REJECTION_BUFFER_PCT)
+        close_not_too_far = (break_level - c) <= max_close_away
+        bounce_size = max(0.0, h - c)
+        enough_bounce = bounce_size >= min_bounce_abs
+        enough_body = body_abs >= min_body_abs
+
+        ok = touched and bearish_close and close_not_too_far and enough_bounce and enough_body
+        reason = (
+            f"touched={touched}, bearish_close={bearish_close}, close_not_too_far={close_not_too_far}, "
+            f"enough_bounce={enough_bounce}, enough_body={enough_body}"
+        )
+        return ok, reason
+
+    if side == "LONG":
+        touched = l <= break_level * (1.0 + RETEST_TOL_PCT)
+        bullish_close = c >= break_level * (1.0 + RETEST_REJECTION_BUFFER_PCT)
+        close_not_too_far = (c - break_level) <= max_close_away
+        bounce_size = max(0.0, c - l)
+        enough_bounce = bounce_size >= min_bounce_abs
+        enough_body = body_abs >= min_body_abs
+
+        ok = touched and bullish_close and close_not_too_far and enough_bounce and enough_body
+        reason = (
+            f"touched={touched}, bullish_close={bullish_close}, close_not_too_far={close_not_too_far}, "
+            f"enough_bounce={enough_bounce}, enough_body={enough_body}"
+        )
+        return ok, reason
+
+    return False, "unknown side"
+
+
 # ============================================================
 # FEATURES
 # ============================================================
@@ -376,7 +585,6 @@ def make_features(
 
     df = pd.concat(series, axis=1).dropna()
     df = df[~df.index.duplicated(keep="last")]
-    print(f"[FEATS] aligned rows before features: {len(df)}")
 
     df = df.join(
         xau_ohlc[["Open", "High", "Low"]].rename(
@@ -457,7 +665,6 @@ def make_features(
 
     df = df.dropna()
     df = df[~df.index.duplicated(keep="last")]
-    print(f"[FEATS] rows after features: {len(df)}")
     return df
 
 
@@ -534,17 +741,19 @@ def evaluate_tracking(
     p_up_adj: float | None = None,
 ) -> tuple[dict, list[str]]:
     msgs: list[str] = []
+
     if len(xau_ohlc) < 3:
         return state, msgs
 
     last_bar_date = xau_ohlc.index[-1]
     bar = xau_ohlc.iloc[-1]
+    o = float(bar["Open"])
     h = float(bar["High"])
     l = float(bar["Low"])
     c = float(bar["Close"])
 
     t = state.get("trade")
-    if not isinstance(t, dict):
+    if not isinstance(t, dict) or not t:
         return state, msgs
 
     if t.get("last_processed_date") == str(last_bar_date.date()):
@@ -552,13 +761,35 @@ def evaluate_tracking(
 
     status = t.get("status")
     side = t.get("side")
-    entry = float(t.get("entry", 0) or 0)
-    sl = float(t.get("sl", 0) or 0)
-    tp = float(t.get("tp", 0) or 0)
+    entry = float(t.get("entry", 0.0) or 0.0)
+    sl = float(t.get("sl", 0.0) or 0.0)
+    tp = float(t.get("tp", 0.0) or 0.0)
     valid_until = t.get("valid_until")
-    stop_dist = float(t.get("stop_dist", 0) or 0)
-    break_level = float(t.get("break_level", 0) or 0)
+    stop_dist = float(t.get("stop_dist", 0.0) or 0.0)
+    break_level = float(t.get("break_level", 0.0) or 0.0)
     entry_mode = str(t.get("entry_mode", "BREAKOUT") or "BREAKOUT")
+
+    t = update_running_extremes(t, side, h, l, entry)
+    mfe_today, mae_today = calc_mfe_mae(side, entry, h, l)
+
+    if status in ("PENDING", "OPEN"):
+        msgs.append(
+            "📊 DAILY UPDATE\n"
+            f"Date: {last_bar_date.date()}\n"
+            f"Side: {side}\n"
+            f"Status: {status}\n"
+            f"Mode: {entry_mode}\n"
+            f"Entry: {entry:.2f}\n"
+            f"SL: {sl:.2f}\n"
+            f"TP: {tp:.2f}\n"
+            f"Today High: {h:.2f}\n"
+            f"Today Low: {l:.2f}\n"
+            f"Today Close: {c:.2f}\n"
+            f"MFE(today): {mfe_today:.2f}\n"
+            f"MAE(today): {mae_today:.2f}\n"
+            f"MFE(max): {float(t.get('max_favorable', 0.0)):.2f}\n"
+            f"MAE(max): {float(t.get('max_adverse', 0.0)):.2f}"
+        )
 
     if status == "PENDING":
         triggered = False
@@ -573,21 +804,28 @@ def evaluate_tracking(
                 trigger_reason = "breakout touched entry"
 
         elif entry_mode == "RETEST":
+            atr_for_trigger = stop_dist / STOP_ATR_MULT if STOP_ATR_MULT > 0 else 0.0
+            reject_ok, reject_reason = rejection_filter(
+                side=side,
+                o=o,
+                h=h,
+                l=l,
+                c=c,
+                break_level=break_level,
+                atr=atr_for_trigger,
+            )
+
             if side == "LONG":
-                near_level = l <= break_level * (1.0 + RETEST_TOL_PCT)
-                rejection_ok = c >= break_level * (1.0 + RETEST_REJECTION_BUFFER_PCT)
                 touched_entry = h >= entry
-                if near_level and rejection_ok and touched_entry:
+                if reject_ok and touched_entry:
                     triggered = True
-                    trigger_reason = "retest + bullish rejection"
+                    trigger_reason = f"retest + bullish rejection | {reject_reason}"
 
             elif side == "SHORT":
-                near_level = h >= break_level * (1.0 - RETEST_TOL_PCT)
-                rejection_ok = c <= break_level * (1.0 - RETEST_REJECTION_BUFFER_PCT)
                 touched_entry = l <= entry
-                if near_level and rejection_ok and touched_entry:
+                if reject_ok and touched_entry:
                     triggered = True
-                    trigger_reason = "retest + bearish rejection"
+                    trigger_reason = f"retest + bearish rejection | {reject_reason}"
 
         if triggered:
             t["status"] = "OPEN"
@@ -605,21 +843,28 @@ def evaluate_tracking(
             )
         elif valid_until and str(last_bar_date.date()) >= valid_until:
             t["status"] = "CANCELLED"
+            t["result"] = "CANCELLED"
+            t["close_date"] = str(last_bar_date.date())
+            add_journal_entry(state, t, "CANCELLED", str(last_bar_date.date()), close_price=c)
             msgs.append(
                 "⏹️ SETUP CANCELLED\n"
                 f"Date: {last_bar_date.date()}\n"
                 f"Reason: Not triggered before next NY close\n"
                 f"Side: {side}\n"
                 f"Mode: {entry_mode}\n"
-                f"Entry: {entry:.2f}"
+                f"Entry: {entry:.2f}\n\n"
+                + stats_text(state)
             )
 
     if t.get("status") == "OPEN":
         be_moved = bool(t.get("be_moved", False))
+        current_sl = float(t.get("sl", sl) or sl)
+
         if (not be_moved) and stop_dist > 0:
             if side == "LONG" and h >= entry + stop_dist:
                 t["sl"] = entry
                 t["be_moved"] = True
+                current_sl = entry
                 msgs.append(
                     "🟦 MOVE STOP TO BREAK-EVEN\n"
                     f"Date: {last_bar_date.date()}\n"
@@ -629,6 +874,7 @@ def evaluate_tracking(
             elif side == "SHORT" and l <= entry - stop_dist:
                 t["sl"] = entry
                 t["be_moved"] = True
+                current_sl = entry
                 msgs.append(
                     "🟦 MOVE STOP TO BREAK-EVEN\n"
                     f"Date: {last_bar_date.date()}\n"
@@ -660,12 +906,14 @@ def evaluate_tracking(
                 t["status"] = "CLOSED"
                 t["result"] = "EXIT_NOW"
                 t["close_date"] = str(last_bar_date.date())
+                add_journal_entry(state, t, "EXIT_NOW", str(last_bar_date.date()), close_price=c)
                 msgs.append(
                     "🟨 EXIT NOW\n"
                     f"Date: {last_bar_date.date()}\n"
                     f"Side: {side}\n"
                     f"Reason: {exit_reason}\n"
-                    f"Close: {c:.2f}"
+                    f"Close: {c:.2f}\n\n"
+                    + stats_text(state)
                 )
 
         if t.get("status") == "OPEN":
@@ -679,25 +927,41 @@ def evaluate_tracking(
                 hit_tp = l <= tp
 
             if hit_sl or hit_tp:
-                result = "STOP" if hit_sl else "TAKE_PROFIT"
                 if hit_sl and hit_tp:
                     result = "STOP"
+                elif hit_tp:
+                    result = "TAKE_PROFIT"
+                else:
+                    result = "BREAKEVEN" if abs(current_sl - entry) < 1e-9 else "STOP"
 
                 t["status"] = "CLOSED"
                 t["result"] = result
                 t["close_date"] = str(last_bar_date.date())
 
+                close_price_for_journal = tp if result == "TAKE_PROFIT" else current_sl
+                add_journal_entry(state, t, result, str(last_bar_date.date()), close_price=close_price_for_journal)
+
+                emoji = "🟩" if result == "TAKE_PROFIT" else ("⬜" if result == "BREAKEVEN" else "🟥")
+                label = "TAKE PROFIT" if result == "TAKE_PROFIT" else ("BREAK-EVEN" if result == "BREAKEVEN" else "STOP")
+
                 msgs.append(
-                    ("🟥 TRADE CLOSED (STOP)\n" if result == "STOP" else "🟩 TRADE CLOSED (TAKE PROFIT)\n")
-                    + f"Date: {last_bar_date.date()}\n"
-                    + f"Side: {side}\n"
-                    + f"Entry: {entry:.2f}\n"
-                    + f"SL: {current_sl:.2f}\n"
-                    + f"TP: {tp:.2f}"
+                    f"{emoji} TRADE CLOSED ({label})\n"
+                    f"Date: {last_bar_date.date()}\n"
+                    f"Side: {side}\n"
+                    f"Entry: {entry:.2f}\n"
+                    f"SL: {current_sl:.2f}\n"
+                    f"TP: {tp:.2f}\n"
+                    f"MFE(max): {float(t.get('max_favorable', 0.0)):.2f}\n"
+                    f"MAE(max): {float(t.get('max_adverse', 0.0)):.2f}\n\n"
+                    + stats_text(state)
                 )
 
-    t["last_processed_date"] = str(last_bar_date.date())
-    state["trade"] = t
+    if t.get("status") in ("CLOSED", "CANCELLED"):
+        state["trade"] = {}
+    else:
+        t["last_processed_date"] = str(last_bar_date.date())
+        state["trade"] = t
+
     return state, msgs
 
 
@@ -743,8 +1007,6 @@ def main() -> None:
         feature_cols += ["real_f_chg5"]
     feature_cols += ["trend_up"]
 
-    print("[MODEL] feature cols:", feature_cols)
-
     X = feats[feature_cols]
     y = feats["y"].astype(int)
 
@@ -752,8 +1014,6 @@ def main() -> None:
     X_train = X.iloc[-TRAIN_DAYS - 1:-1]
     y_train = y.iloc[-TRAIN_DAYS - 1:-1]
     X_last = X.loc[[last_day]]
-
-    print(f"[MODEL] train rows={len(X_train)} infer_date={last_day.date()}")
 
     model = Pipeline([
         ("scaler", StandardScaler()),
@@ -785,9 +1045,7 @@ def main() -> None:
         send_telegram(m)
 
     trade = state.get("trade", {})
-    if trade.get("status") in ("PENDING", "OPEN"):
-        save_state(state)
-        return
+    has_active_trade = trade.get("status") in ("PENDING", "OPEN")
 
     trend_up = int(feats.loc[last_day, "trend_up"]) == 1
     trend_txt = "UP" if trend_up else "DOWN"
@@ -863,6 +1121,7 @@ def main() -> None:
         f"RiskGate: {risk_gate}\n"
         f"ChartScore: {chart_score}/5\n"
         f"EntryMode: {ENTRY_MODE}\n"
+        f"HasActiveTrade: {has_active_trade}\n"
     )
 
     if real_available:
@@ -890,8 +1149,12 @@ def main() -> None:
         f"Take Profit: {tp:.2f}\n"
         f"ATR({ATR_LEN}): {atr:.2f}\n"
         f"StopDist: {stop_dist:.2f}\n"
-        f"Suggested lot: {lot:.2f}\n"
+        f"Suggested lot: {lot:.2f}\n\n"
+        f"Performance Snapshot:\n{stats_text(state)}\n"
     )
+
+    if has_active_trade:
+        msg += "\nNote: Active trade exists, new setup will NOT be stored.\n"
 
     if trade_skipped:
         msg += f"\nTrade: SKIPPED\nReason: {skip_reason}\n"
@@ -901,7 +1164,7 @@ def main() -> None:
     if side != "NO-TRADE" or SEND_NO_TRADE:
         send_telegram(msg)
 
-    if side in ("LONG", "SHORT") and not trade_skipped:
+    if side in ("LONG", "SHORT") and not trade_skipped and not has_active_trade:
         state["trade"] = {
             "status": "PENDING",
             "created_date": str(last_day.date()),
@@ -911,11 +1174,14 @@ def main() -> None:
             "entry": float(entry),
             "break_level": float(break_level),
             "sl": float(sl),
+            "sl_initial": float(sl),
             "tp": float(tp),
             "lot": float(lot),
             "stop_dist": float(stop_dist),
             "be_moved": False,
-            "last_processed_date": state.get("trade", {}).get("last_processed_date"),
+            "max_favorable": 0.0,
+            "max_adverse": 0.0,
+            "last_processed_date": trade.get("last_processed_date"),
         }
 
     save_state(state)
