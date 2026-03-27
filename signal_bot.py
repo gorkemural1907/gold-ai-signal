@@ -495,7 +495,7 @@ def stats_text(state: dict) -> str:
         f"WinRate: {float(s.get('winrate', 0.0)):.2f}%\n"
         f"Avg R: {float(s.get('avg_r', 0.0)):.2f}\n"
         f"Expectancy: {float(s.get('expectancy_r', 0.0)):.2f}R"
-    }
+    )
 
 
 def rejection_filter(
