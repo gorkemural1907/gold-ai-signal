@@ -251,14 +251,6 @@ ATR_SLOW_LEN = 20
 STOP_ATR_MULT = 1.2
 RR = 2.0
 
-ACCOUNT_USD = 1000.0
-MAX_RISK_PCT = 2.0
-MAX_RISK_USD = ACCOUNT_USD * (MAX_RISK_PCT / 100.0)
-
-LOT_OZ = 100.0
-MIN_LOT = 0.01
-LOT_STEP = 0.01
-
 SPREAD_BPS = 10
 SPREAD = SPREAD_BPS / 10000.0
 HALF_SPREAD = SPREAD / 2.0
@@ -284,10 +276,9 @@ LATE_ENTRY_ATR_FRACTION = 0.25
 RETEST_TOL_PCT = 0.0010
 RETEST_REJECTION_BUFFER_PCT = 0.0003
 
-# Yeni: bounce / rejection kalitesi
-MIN_REJECTION_BODY_PCT = 0.0015      # %0.15
-MIN_BOUNCE_FROM_LEVEL_ATR = 0.10     # en az 0.10 ATR rejection
-MAX_CLOSE_AWAY_FROM_LEVEL_ATR = 0.35 # close çok uzak kaçtıysa chase say
+MIN_REJECTION_BODY_PCT = 0.0015
+MIN_BOUNCE_FROM_LEVEL_ATR = 0.10
+MAX_CLOSE_AWAY_FROM_LEVEL_ATR = 0.35
 
 # ============================================================
 # HELPERS
@@ -307,16 +298,6 @@ def compute_atr(df: pd.DataFrame, n: int) -> pd.Series:
 
 def clamp01(x: float) -> float:
     return float(min(0.999, max(0.001, x)))
-
-
-def round_down(x: float, step: float) -> float:
-    return math.floor(x / step) * step if step > 0 else x
-
-
-def lot_from_risk(stop_distance: float, risk_usd: float) -> float:
-    if stop_distance <= 0:
-        return 0.0
-    return risk_usd / (stop_distance * LOT_OZ)
 
 
 def late_entry_filter(
@@ -471,6 +452,7 @@ def add_journal_entry(
         "close_date": close_date,
         "side": trade.get("side"),
         "entry_mode": trade.get("entry_mode"),
+        "grade": trade.get("grade"),
         "entry": round(entry, 4),
         "sl": round(float(trade.get("sl_initial", trade.get("sl", 0.0)) or 0.0), 4),
         "tp": round(float(trade.get("tp", 0.0) or 0.0), 4),
@@ -507,13 +489,6 @@ def rejection_filter(
     break_level: float,
     atr: float,
 ) -> tuple[bool, str]:
-    """
-    Gecikmiş breakdown chase'i azaltmak için:
-    - level'e yakın temas
-    - rejection yönlü close
-    - yeterli body / bounce
-    - close levelden aşırı uzak değil
-    """
     if atr <= 0 or not np.isfinite(atr):
         return False, "invalid ATR"
 
@@ -553,6 +528,73 @@ def rejection_filter(
         return ok, reason
 
     return False, "unknown side"
+
+
+def compute_grade(
+    side: str,
+    p_adj: float,
+    chart_score: int,
+    late_filter_reason: str,
+    rejection_ok: bool,
+    trend_up: bool,
+    real_chg5: float | None,
+) -> tuple[str, list[str]]:
+    reasons: list[str] = []
+    score = 0
+
+    edge = abs(p_adj - 0.5)
+
+    if side == "NO-TRADE":
+        return "N/A", ["no valid setup"]
+
+    if side == "LONG":
+        if trend_up:
+            score += 1
+            reasons.append("trend aligned")
+        if p_adj >= 0.64:
+            score += 2
+            reasons.append("strong AI edge")
+        elif p_adj >= 0.60:
+            score += 1
+            reasons.append("good AI edge")
+        if real_chg5 is not None and np.isfinite(real_chg5) and real_chg5 > 0:
+            score += 1
+            reasons.append("real factor aligned")
+
+    elif side == "SHORT":
+        if not trend_up:
+            score += 1
+            reasons.append("trend aligned")
+        if p_adj <= 0.36:
+            score += 2
+            reasons.append("strong AI edge")
+        elif p_adj <= 0.40:
+            score += 1
+            reasons.append("good AI edge")
+        if real_chg5 is not None and np.isfinite(real_chg5) and real_chg5 < 0:
+            score += 1
+            reasons.append("real factor aligned")
+
+    if chart_score >= 4:
+        score += 2
+        reasons.append("strong chart quality")
+    elif chart_score >= 3:
+        score += 1
+        reasons.append("good chart quality")
+
+    if rejection_ok:
+        score += 1
+        reasons.append("clean rejection setup")
+
+    if not late_filter_reason:
+        score += 1
+        reasons.append("not late")
+
+    if score >= 6:
+        return "A", reasons
+    if score >= 4:
+        return "B", reasons
+    return "C", reasons
 
 
 # ============================================================
@@ -768,6 +810,7 @@ def evaluate_tracking(
     stop_dist = float(t.get("stop_dist", 0.0) or 0.0)
     break_level = float(t.get("break_level", 0.0) or 0.0)
     entry_mode = str(t.get("entry_mode", "BREAKOUT") or "BREAKOUT")
+    grade = str(t.get("grade", "N/A"))
 
     t = update_running_extremes(t, side, h, l, entry)
     mfe_today, mae_today = calc_mfe_mae(side, entry, h, l)
@@ -777,6 +820,7 @@ def evaluate_tracking(
             "📊 DAILY UPDATE\n"
             f"Date: {last_bar_date.date()}\n"
             f"Side: {side}\n"
+            f"Grade: {grade}\n"
             f"Status: {status}\n"
             f"Mode: {entry_mode}\n"
             f"Entry: {entry:.2f}\n"
@@ -835,6 +879,7 @@ def evaluate_tracking(
                 "✅ TRADE TRIGGERED\n"
                 f"Date: {last_bar_date.date()}\n"
                 f"Side: {side}\n"
+                f"Grade: {grade}\n"
                 f"Mode: {entry_mode}\n"
                 f"Trigger: {trigger_reason}\n"
                 f"Entry: {entry:.2f}\n"
@@ -849,8 +894,8 @@ def evaluate_tracking(
             msgs.append(
                 "⏹️ SETUP CANCELLED\n"
                 f"Date: {last_bar_date.date()}\n"
-                f"Reason: Not triggered before next NY close\n"
                 f"Side: {side}\n"
+                f"Grade: {grade}\n"
                 f"Mode: {entry_mode}\n"
                 f"Entry: {entry:.2f}\n\n"
                 + stats_text(state)
@@ -911,6 +956,7 @@ def evaluate_tracking(
                     "🟨 EXIT NOW\n"
                     f"Date: {last_bar_date.date()}\n"
                     f"Side: {side}\n"
+                    f"Grade: {grade}\n"
                     f"Reason: {exit_reason}\n"
                     f"Close: {c:.2f}\n\n"
                     + stats_text(state)
@@ -948,6 +994,7 @@ def evaluate_tracking(
                     f"{emoji} TRADE CLOSED ({label})\n"
                     f"Date: {last_bar_date.date()}\n"
                     f"Side: {side}\n"
+                    f"Grade: {grade}\n"
                     f"Entry: {entry:.2f}\n"
                     f"SL: {current_sl:.2f}\n"
                     f"TP: {tp:.2f}\n"
@@ -1068,19 +1115,30 @@ def main() -> None:
     y_high = float(ybar["High"])
     y_low = float(ybar["Low"])
     close_now = float(xau["Close"].iloc[-1])
+    today_bar = xau.iloc[-1]
+    today_o = float(today_bar["Open"])
+    today_h = float(today_bar["High"])
+    today_l = float(today_bar["Low"])
+    today_c = float(today_bar["Close"])
 
     late_filter_reason = ""
     late_move = 0.0
+    rejection_ok = False
+    rejection_reason = ""
+    grade = "N/A"
+    grade_reasons: list[str] = []
 
     if side == "LONG":
         entry, sl, tp, break_level = build_trade_setup("LONG", y_high, y_low, atr)
         is_late, late_filter_reason, late_move = late_entry_filter("LONG", close_now, y_high, atr)
+        rejection_ok, rejection_reason = rejection_filter("LONG", today_o, today_h, today_l, today_c, break_level, atr)
         if is_late:
             side = "NO-TRADE"
 
     elif side == "SHORT":
         entry, sl, tp, break_level = build_trade_setup("SHORT", y_high, y_low, atr)
         is_late, late_filter_reason, late_move = late_entry_filter("SHORT", close_now, y_low, atr)
+        rejection_ok, rejection_reason = rejection_filter("SHORT", today_o, today_h, today_l, today_c, break_level, atr)
         if is_late:
             side = "NO-TRADE"
 
@@ -1090,17 +1148,19 @@ def main() -> None:
         tp = float("nan")
         break_level = float("nan")
 
-    stop_dist = STOP_ATR_MULT * atr
-    lot_raw = lot_from_risk(stop_dist, MAX_RISK_USD)
-    lot = round_down(lot_raw, LOT_STEP)
+    if side in ("LONG", "SHORT"):
+        grade, grade_reasons = compute_grade(
+            side=side,
+            p_adj=p_adj,
+            chart_score=chart_score,
+            late_filter_reason=late_filter_reason,
+            rejection_ok=rejection_ok,
+            trend_up=trend_up,
+            real_chg5=(real_chg5 if real_available else None),
+        )
 
-    trade_skipped = False
-    skip_reason = ""
-    if side in ("LONG", "SHORT") and lot < MIN_LOT:
-        real_risk_usd = MIN_LOT * stop_dist * LOT_OZ
-        trade_skipped = True
-        skip_reason = f"Risk too large for account. Min lot risk=${real_risk_usd:.2f} > max ${MAX_RISK_USD:.2f}"
-        lot = MIN_LOT
+    stop_dist = STOP_ATR_MULT * atr
+    rr_text = f"1:{RR:.1f}"
 
     risk_gate = "VIX" if used_vix is not None else "SPX_PROXY"
 
@@ -1136,9 +1196,12 @@ def main() -> None:
         msg += f"ChartFilter: {chart_reason}\n"
     if late_filter_reason:
         msg += f"LateFilter: {late_filter_reason}\n"
+    if side in ("LONG", "SHORT"):
+        msg += f"RejectionFilter: {'ok' if rejection_ok else 'weak'}\n"
 
     msg += (
-        f"\nSignal: {side}\n\n"
+        f"\nSignal: {side}\n"
+        f"Grade: {grade}\n\n"
         f"Breakout Entry: {entry:.2f}\n"
         f"BreakLevel: {break_level:.2f}\n"
         f"Yesterday High: {y_high:.2f}\n"
@@ -1149,34 +1212,37 @@ def main() -> None:
         f"Take Profit: {tp:.2f}\n"
         f"ATR({ATR_LEN}): {atr:.2f}\n"
         f"StopDist: {stop_dist:.2f}\n"
-        f"Suggested lot: {lot:.2f}\n\n"
-        f"Performance Snapshot:\n{stats_text(state)}\n"
+        f"RR: {rr_text}\n"
     )
+
+    if grade_reasons:
+        msg += "\nQuality:\n"
+        for reason in grade_reasons:
+            msg += f"- {reason}\n"
+
+    msg += f"\nPerformance Snapshot:\n{stats_text(state)}\n"
 
     if has_active_trade:
         msg += "\nNote: Active trade exists, new setup will NOT be stored.\n"
-
-    if trade_skipped:
-        msg += f"\nTrade: SKIPPED\nReason: {skip_reason}\n"
 
     print(msg)
 
     if side != "NO-TRADE" or SEND_NO_TRADE:
         send_telegram(msg)
 
-    if side in ("LONG", "SHORT") and not trade_skipped and not has_active_trade:
+    if side in ("LONG", "SHORT") and not has_active_trade:
         state["trade"] = {
             "status": "PENDING",
             "created_date": str(last_day.date()),
             "valid_until": str(last_day.date()),
             "side": side,
+            "grade": grade,
             "entry_mode": ENTRY_MODE,
             "entry": float(entry),
             "break_level": float(break_level),
             "sl": float(sl),
             "sl_initial": float(sl),
             "tp": float(tp),
-            "lot": float(lot),
             "stop_dist": float(stop_dist),
             "be_moved": False,
             "max_favorable": 0.0,
