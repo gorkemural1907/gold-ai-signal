@@ -1,4 +1,4 @@
-name: Disabled Old Workflow
+name: Disabled
 
 on:
   workflow_dispatch:
