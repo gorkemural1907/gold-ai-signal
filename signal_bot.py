@@ -1,5 +1,4 @@
 import os
-import math
 import time
 import json
 from io import StringIO
@@ -215,7 +214,6 @@ def fetch_ohlc_with_fallback(name: str, providers: list[tuple[str, str]]) -> tup
                 df = fetch_ohlc_yahoo(symbol)
                 return df, f"{provider}:{symbol}"
             raise RuntimeError(f"Unknown provider {provider}")
-
         except Exception as e:
             err = f"{provider}:{symbol} -> {type(e).__name__}: {str(e)[:120]}"
             print(f"[DATA][FALLBACK] {name} {err}")
@@ -267,18 +265,23 @@ MIN_CHART_SCORE_TO_TRADE = 2
 EXIT_P_ADJ_LONG = 0.50
 EXIT_P_ADJ_SHORT = 0.50
 
-# ============================================================
-# ENTRY UPGRADE
-# ============================================================
-ENTRY_MODE = "RETEST"   # "BREAKOUT" or "RETEST"
-
+# Retest layer
+ENTRY_MODE_DEFAULT = "RETEST"
 LATE_ENTRY_ATR_FRACTION = 0.25
 RETEST_TOL_PCT = 0.0010
 RETEST_REJECTION_BUFFER_PCT = 0.0003
-
 MIN_REJECTION_BODY_PCT = 0.0015
 MIN_BOUNCE_FROM_LEVEL_ATR = 0.10
 MAX_CLOSE_AWAY_FROM_LEVEL_ATR = 0.35
+
+# Momentum layer
+ENABLE_MOMENTUM_LAYER = True
+MOMENTUM_P_LONG = 0.56
+MOMENTUM_P_SHORT = 0.44
+MOMENTUM_MIN_CLOSE_POS_LONG = 0.70
+MOMENTUM_MAX_CLOSE_POS_SHORT = 0.30
+MOMENTUM_BREAKOUT_BUFFER_ATR = 0.05
+MOMENTUM_STOP_ATR_MULT = 1.0
 
 # ============================================================
 # HELPERS
@@ -318,10 +321,7 @@ def late_entry_filter(
 
     limit = LATE_ENTRY_ATR_FRACTION * atr
     is_late = move > limit
-    reason = (
-        f"late entry: move {move:.2f} > {LATE_ENTRY_ATR_FRACTION:.2f}*ATR ({limit:.2f})"
-        if is_late else ""
-    )
+    reason = f"late entry: move {move:.2f} > {LATE_ENTRY_ATR_FRACTION:.2f}*ATR ({limit:.2f})" if is_late else ""
     return is_late, reason, move
 
 
@@ -330,24 +330,45 @@ def build_trade_setup(
     y_high: float,
     y_low: float,
     atr: float,
+    mode: str,
 ) -> tuple[float, float, float, float]:
-    if side == "LONG":
-        break_level = y_high
-        entry = y_high * (1.0 + HALF_SPREAD)
-        sl = entry - STOP_ATR_MULT * atr
-        tp = entry + RR * (STOP_ATR_MULT * atr)
-    elif side == "SHORT":
-        break_level = y_low
-        entry = y_low * (1.0 - HALF_SPREAD)
-        sl = entry + STOP_ATR_MULT * atr
-        tp = entry - RR * (STOP_ATR_MULT * atr)
-    else:
-        break_level = float("nan")
-        entry = float("nan")
-        sl = float("nan")
-        tp = float("nan")
+    if mode == "RETEST":
+        if side == "LONG":
+            break_level = y_high
+            entry = y_high * (1.0 + HALF_SPREAD)
+            sl = entry - STOP_ATR_MULT * atr
+            tp = entry + RR * (STOP_ATR_MULT * atr)
+        elif side == "SHORT":
+            break_level = y_low
+            entry = y_low * (1.0 - HALF_SPREAD)
+            sl = entry + STOP_ATR_MULT * atr
+            tp = entry - RR * (STOP_ATR_MULT * atr)
+        else:
+            break_level = float("nan")
+            entry = float("nan")
+            sl = float("nan")
+            tp = float("nan")
+        return entry, sl, tp, break_level
 
-    return entry, sl, tp, break_level
+    if mode == "MOMENTUM":
+        if side == "LONG":
+            break_level = y_high
+            entry = y_high + (MOMENTUM_BREAKOUT_BUFFER_ATR * atr)
+            sl = entry - MOMENTUM_STOP_ATR_MULT * atr
+            tp = entry + RR * (MOMENTUM_STOP_ATR_MULT * atr)
+        elif side == "SHORT":
+            break_level = y_low
+            entry = y_low - (MOMENTUM_BREAKOUT_BUFFER_ATR * atr)
+            sl = entry + MOMENTUM_STOP_ATR_MULT * atr
+            tp = entry - RR * (MOMENTUM_STOP_ATR_MULT * atr)
+        else:
+            break_level = float("nan")
+            entry = float("nan")
+            sl = float("nan")
+            tp = float("nan")
+        return entry, sl, tp, break_level
+
+    return float("nan"), float("nan"), float("nan"), float("nan")
 
 
 def calc_mfe_mae(side: str, entry: float, high: float, low: float) -> tuple[float, float]:
@@ -504,7 +525,6 @@ def rejection_filter(
         bounce_size = max(0.0, h - c)
         enough_bounce = bounce_size >= min_bounce_abs
         enough_body = body_abs >= min_body_abs
-
         ok = touched and bearish_close and close_not_too_far and enough_bounce and enough_body
         reason = (
             f"touched={touched}, bearish_close={bearish_close}, close_not_too_far={close_not_too_far}, "
@@ -519,13 +539,50 @@ def rejection_filter(
         bounce_size = max(0.0, c - l)
         enough_bounce = bounce_size >= min_bounce_abs
         enough_body = body_abs >= min_body_abs
-
         ok = touched and bullish_close and close_not_too_far and enough_bounce and enough_body
         reason = (
             f"touched={touched}, bullish_close={bullish_close}, close_not_too_far={close_not_too_far}, "
             f"enough_bounce={enough_bounce}, enough_body={enough_body}"
         )
         return ok, reason
+
+    return False, "unknown side"
+
+
+def momentum_filter(
+    side: str,
+    p_adj: float,
+    trend_up: bool,
+    chart_score: int,
+    close_pos: float,
+    vol_expansion: int,
+    close_now: float,
+    y_high: float,
+    y_low: float,
+    atr: float,
+) -> tuple[bool, str]:
+    if atr <= 0 or not np.isfinite(atr):
+        return False, "invalid ATR"
+
+    if side == "LONG":
+        conds = {
+            "vol_expansion": vol_expansion == 1,
+            "p_adj": p_adj >= MOMENTUM_P_LONG,
+            "close_pos": close_pos >= MOMENTUM_MIN_CLOSE_POS_LONG,
+            "breakout": close_now >= y_high + MOMENTUM_BREAKOUT_BUFFER_ATR * atr,
+        }
+        ok = all(conds.values())
+        return ok, ", ".join([f"{k}={v}" for k, v in conds.items()])
+
+    if side == "SHORT":
+        conds = {
+            "vol_expansion": vol_expansion == 1,
+            "p_adj": p_adj <= MOMENTUM_P_SHORT,
+            "close_pos": close_pos <= MOMENTUM_MAX_CLOSE_POS_SHORT,
+            "breakout": close_now <= y_low - MOMENTUM_BREAKOUT_BUFFER_ATR * atr,
+        }
+        ok = all(conds.values())
+        return ok, ", ".join([f"{k}={v}" for k, v in conds.items()])
 
     return False, "unknown side"
 
@@ -538,11 +595,11 @@ def compute_grade(
     rejection_ok: bool,
     trend_up: bool,
     real_chg5: float | None,
+    entry_mode: str,
+    momentum_ok: bool,
 ) -> tuple[str, list[str]]:
     reasons: list[str] = []
     score = 0
-
-    edge = abs(p_adj - 0.5)
 
     if side == "NO-TRADE":
         return "N/A", ["no valid setup"]
@@ -575,20 +632,28 @@ def compute_grade(
             score += 1
             reasons.append("real factor aligned")
 
-    if chart_score >= 4:
-        score += 2
-        reasons.append("strong chart quality")
-    elif chart_score >= 3:
-        score += 1
-        reasons.append("good chart quality")
+    if entry_mode == "RETEST":
+        if chart_score >= 4:
+            score += 2
+            reasons.append("strong chart quality")
+        elif chart_score >= 3:
+            score += 1
+            reasons.append("good chart quality")
+        if rejection_ok:
+            score += 1
+            reasons.append("clean rejection setup")
+        if not late_filter_reason:
+            score += 1
+            reasons.append("not late")
 
-    if rejection_ok:
-        score += 1
-        reasons.append("clean rejection setup")
-
-    if not late_filter_reason:
-        score += 1
-        reasons.append("not late")
+    elif entry_mode == "MOMENTUM":
+        if momentum_ok:
+            score += 2
+            reasons.append("momentum expansion setup")
+        if chart_score >= 1:
+            score += 1
+            reasons.append("minimum chart confirmation")
+        reasons.append("trend continuation mode")
 
     if score >= 6:
         return "A", reasons
@@ -809,7 +874,7 @@ def evaluate_tracking(
     valid_until = t.get("valid_until")
     stop_dist = float(t.get("stop_dist", 0.0) or 0.0)
     break_level = float(t.get("break_level", 0.0) or 0.0)
-    entry_mode = str(t.get("entry_mode", "BREAKOUT") or "BREAKOUT")
+    entry_mode = str(t.get("entry_mode", ENTRY_MODE_DEFAULT) or ENTRY_MODE_DEFAULT)
     grade = str(t.get("grade", "N/A"))
 
     t = update_running_extremes(t, side, h, l, entry)
@@ -839,15 +904,7 @@ def evaluate_tracking(
         triggered = False
         trigger_reason = ""
 
-        if entry_mode == "BREAKOUT":
-            if side == "LONG" and h >= entry:
-                triggered = True
-                trigger_reason = "breakout touched entry"
-            elif side == "SHORT" and l <= entry:
-                triggered = True
-                trigger_reason = "breakout touched entry"
-
-        elif entry_mode == "RETEST":
+        if entry_mode == "RETEST":
             atr_for_trigger = stop_dist / STOP_ATR_MULT if STOP_ATR_MULT > 0 else 0.0
             reject_ok, reject_reason = rejection_filter(
                 side=side,
@@ -864,12 +921,19 @@ def evaluate_tracking(
                 if reject_ok and touched_entry:
                     triggered = True
                     trigger_reason = f"retest + bullish rejection | {reject_reason}"
-
             elif side == "SHORT":
                 touched_entry = l <= entry
                 if reject_ok and touched_entry:
                     triggered = True
                     trigger_reason = f"retest + bearish rejection | {reject_reason}"
+
+        elif entry_mode == "MOMENTUM":
+            if side == "LONG" and h >= entry:
+                triggered = True
+                trigger_reason = "momentum breakout continuation"
+            elif side == "SHORT" and l <= entry:
+                triggered = True
+                trigger_reason = "momentum breakdown continuation"
 
         if triggered:
             t["status"] = "OPEN"
@@ -936,14 +1000,14 @@ def evaluate_tracking(
                 if p_up_adj < EXIT_P_ADJ_LONG:
                     exit_now = True
                     exit_reason = f"AI weakened (P_adj={p_up_adj:.4f})"
-                elif chart_score < 1:
+                elif chart_score < 1 and entry_mode == "RETEST":
                     exit_now = True
                     exit_reason = f"Chart weakened ({chart_reason})"
             elif side == "SHORT":
                 if p_up_adj > EXIT_P_ADJ_SHORT:
                     exit_now = True
                     exit_reason = f"AI weakened (P_adj={p_up_adj:.4f})"
-                elif chart_score < 1:
+                elif chart_score < 1 and entry_mode == "RETEST":
                     exit_now = True
                     exit_reason = f"Chart weakened ({chart_reason})"
 
@@ -1094,26 +1158,12 @@ def main() -> None:
     trade = state.get("trade", {})
     has_active_trade = trade.get("status") in ("PENDING", "OPEN")
 
-    trend_up = int(feats.loc[last_day, "trend_up"]) == 1
+    r = feats.loc[last_day]
+    trend_up = int(r["trend_up"]) == 1
     trend_txt = "UP" if trend_up else "DOWN"
-
-    side = "NO-TRADE"
-    if (p_adj > TH_LONG) and ((p_adj - 0.5) >= MIN_EDGE) and trend_up:
-        side = "LONG"
-    elif (p_adj < TH_SHORT) and ((0.5 - p_adj) >= MIN_EDGE) and (not trend_up):
-        side = "SHORT"
-
     chart_score = 0
     chart_reason = ""
-    if side in ("LONG", "SHORT"):
-        chart_ok, chart_reason, chart_score = chart_filters(feats, last_day, side)
-        if not chart_ok:
-            side = "NO-TRADE"
 
-    atr = float(feats.loc[last_day, "atr14"])
-    ybar = xau.iloc[-2]
-    y_high = float(ybar["High"])
-    y_low = float(ybar["Low"])
     close_now = float(xau["Close"].iloc[-1])
     today_bar = xau.iloc[-1]
     today_o = float(today_bar["Open"])
@@ -1121,32 +1171,80 @@ def main() -> None:
     today_l = float(today_bar["Low"])
     today_c = float(today_bar["Close"])
 
+    atr = float(r["atr14"])
+    close_pos = float(r["close_pos"])
+    vol_expansion = int(r["vol_expansion"])
+
+    ybar = xau.iloc[-2]
+    y_high = float(ybar["High"])
+    y_low = float(ybar["Low"])
+
+    base_side = "NO-TRADE"
+    if (p_adj > TH_LONG) and ((p_adj - 0.5) >= MIN_EDGE):
+        base_side = "LONG"
+    elif (p_adj < TH_SHORT) and ((0.5 - p_adj) >= MIN_EDGE):
+        base_side = "SHORT"
+
+    side = "NO-TRADE"
+    entry_mode = ENTRY_MODE_DEFAULT
+    entry = float(close_now)
+    sl = float("nan")
+    tp = float("nan")
+    break_level = float("nan")
     late_filter_reason = ""
     late_move = 0.0
     rejection_ok = False
     rejection_reason = ""
+    momentum_ok = False
+    momentum_reason = ""
     grade = "N/A"
     grade_reasons: list[str] = []
 
-    if side == "LONG":
-        entry, sl, tp, break_level = build_trade_setup("LONG", y_high, y_low, atr)
-        is_late, late_filter_reason, late_move = late_entry_filter("LONG", close_now, y_high, atr)
-        rejection_ok, rejection_reason = rejection_filter("LONG", today_o, today_h, today_l, today_c, break_level, atr)
-        if is_late:
-            side = "NO-TRADE"
+    # First try RETEST
+    if base_side in ("LONG", "SHORT"):
+        chart_ok, chart_reason, chart_score = chart_filters(feats, last_day, base_side)
 
-    elif side == "SHORT":
-        entry, sl, tp, break_level = build_trade_setup("SHORT", y_high, y_low, atr)
-        is_late, late_filter_reason, late_move = late_entry_filter("SHORT", close_now, y_low, atr)
-        rejection_ok, rejection_reason = rejection_filter("SHORT", today_o, today_h, today_l, today_c, break_level, atr)
-        if is_late:
-            side = "NO-TRADE"
+        if chart_ok:
+            candidate_entry, candidate_sl, candidate_tp, candidate_break_level = build_trade_setup(
+                base_side, y_high, y_low, atr, "RETEST"
+            )
 
-    else:
-        entry = float(close_now)
-        sl = float("nan")
-        tp = float("nan")
-        break_level = float("nan")
+            if base_side == "LONG":
+                is_late, late_filter_reason, late_move = late_entry_filter("LONG", close_now, y_high, atr)
+                rejection_ok, rejection_reason = rejection_filter(
+                    "LONG", today_o, today_h, today_l, today_c, candidate_break_level, atr
+                )
+            else:
+                is_late, late_filter_reason, late_move = late_entry_filter("SHORT", close_now, y_low, atr)
+                rejection_ok, rejection_reason = rejection_filter(
+                    "SHORT", today_o, today_h, today_l, today_c, candidate_break_level, atr
+                )
+
+            if not is_late:
+                side = base_side
+                entry_mode = "RETEST"
+                entry, sl, tp, break_level = candidate_entry, candidate_sl, candidate_tp, candidate_break_level
+
+    # Then try MOMENTUM if RETEST not found
+    if side == "NO-TRADE" and ENABLE_MOMENTUM_LAYER and base_side in ("LONG", "SHORT"):
+        momentum_ok, momentum_reason = momentum_filter(
+            side=base_side,
+            p_adj=p_adj,
+            trend_up=trend_up,
+            chart_score=chart_score,
+            close_pos=close_pos,
+            vol_expansion=vol_expansion,
+            close_now=close_now,
+            y_high=y_high,
+            y_low=y_low,
+            atr=atr,
+        )
+        if momentum_ok:
+            side = base_side
+            entry_mode = "MOMENTUM"
+            entry, sl, tp, break_level = build_trade_setup(base_side, y_high, y_low, atr, "MOMENTUM")
+            late_filter_reason = ""
+            late_move = 0.0
 
     if side in ("LONG", "SHORT"):
         grade, grade_reasons = compute_grade(
@@ -1157,11 +1255,12 @@ def main() -> None:
             rejection_ok=rejection_ok,
             trend_up=trend_up,
             real_chg5=(real_chg5 if real_available else None),
+            entry_mode=entry_mode,
+            momentum_ok=momentum_ok,
         )
 
-    stop_dist = STOP_ATR_MULT * atr
+    stop_dist = abs(entry - sl) if np.isfinite(entry) and np.isfinite(sl) else STOP_ATR_MULT * atr
     rr_text = f"1:{RR:.1f}"
-
     risk_gate = "VIX" if used_vix is not None else "SPX_PROXY"
 
     msg = (
@@ -1180,24 +1279,25 @@ def main() -> None:
         f"Trend(>MA50): {trend_txt}\n"
         f"RiskGate: {risk_gate}\n"
         f"ChartScore: {chart_score}/5\n"
-        f"EntryMode: {ENTRY_MODE}\n"
+        f"EntryMode: {entry_mode if side != 'NO-TRADE' else ENTRY_MODE_DEFAULT}\n"
         f"HasActiveTrade: {has_active_trade}\n"
     )
 
     if real_available:
         msg += f"RealFactor chg5: {real_chg5:+.4f}\n"
     if "gold_real_mom" in feats.columns:
-        msg += f"GoldRealMom5: {float(feats.loc[last_day, 'gold_real_mom']):+.4f}\n"
+        msg += f"GoldRealMom5: {float(r['gold_real_mom']):+.4f}\n"
     if "gold_spx_mom" in feats.columns:
-        msg += f"GoldSPXMom5: {float(feats.loc[last_day, 'gold_spx_mom']):+.4f}\n"
+        msg += f"GoldSPXMom5: {float(r['gold_spx_mom']):+.4f}\n"
     if "vol_expansion" in feats.columns:
-        msg += f"VolExpansion: {int(feats.loc[last_day, 'vol_expansion'])}\n"
+        msg += f"VolExpansion: {int(r['vol_expansion'])}\n"
     if chart_reason:
         msg += f"ChartFilter: {chart_reason}\n"
     if late_filter_reason:
         msg += f"LateFilter: {late_filter_reason}\n"
-    if side in ("LONG", "SHORT"):
+    if base_side in ("LONG", "SHORT"):
         msg += f"RejectionFilter: {'ok' if rejection_ok else 'weak'}\n"
+        msg += f"MomentumFilter: {'ok' if momentum_ok else 'weak'}\n"
 
     msg += (
         f"\nSignal: {side}\n"
@@ -1220,6 +1320,9 @@ def main() -> None:
         for reason in grade_reasons:
             msg += f"- {reason}\n"
 
+    if momentum_reason and side == "NO-TRADE":
+        msg += f"\nMomentumReason: {momentum_reason}\n"
+
     msg += f"\nPerformance Snapshot:\n{stats_text(state)}\n"
 
     if has_active_trade:
@@ -1237,7 +1340,7 @@ def main() -> None:
             "valid_until": str(last_day.date()),
             "side": side,
             "grade": grade,
-            "entry_mode": ENTRY_MODE,
+            "entry_mode": entry_mode,
             "entry": float(entry),
             "break_level": float(break_level),
             "sl": float(sl),
@@ -1258,17 +1361,13 @@ if __name__ == "__main__":
 
     try:
         main()
-
     except Exception as e:
         err = f"{type(e).__name__}: {str(e)[:800]}"
-
         print("FATAL ERROR:", err)
         traceback.print_exc()
-
         try:
             send_telegram(f"❌ BOT ERROR\n{err}")
             print("Telegram error message sent.")
         except Exception as tg_err:
             print("Telegram error send failed:", type(tg_err).__name__, str(tg_err)[:300])
-
         raise
