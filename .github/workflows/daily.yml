@@ -2,8 +2,8 @@ name: Gold AI Signal Bot
 
 on:
   schedule:
-    # Her gün 23:00 UTC
-    - cron: "0 23 * * *"
+    # Her 15 dakikada bir
+    - cron: "*/15 * * * *"
   workflow_dispatch:
 
 jobs:
