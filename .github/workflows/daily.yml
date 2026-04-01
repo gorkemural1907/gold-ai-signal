@@ -1,8 +1,11 @@
-name: Gold AI Signal Bot
+name: Gold AI Signal Bot (Intraday)
 
 on:
   schedule:
+    # primary
     - cron: "1,16,31,46 * * * *"
+    # backup (scheduler bug'a karşı)
+    - cron: "8,23,38,53 * * * *"
   workflow_dispatch:
 
 jobs:
@@ -20,12 +23,17 @@ jobs:
         with:
           python-version: "3.11"
 
+      # 🔥 DEBUG: trigger kontrolü
       - name: Debug trigger info
         run: |
           echo "EVENT NAME: ${{ github.event_name }}"
           echo "RUN ID: ${{ github.run_id }}"
           echo "RUN NUMBER: ${{ github.run_number }}"
           echo "TIME (UTC): $(date -u)"
+
+      # 🔥 DEBUG: cron heartbeat
+      - name: Debug cron heartbeat
+        run: echo "CRON WORKED $(date -u)"
 
       - name: Restore bot state
         uses: actions/cache/restore@v5
