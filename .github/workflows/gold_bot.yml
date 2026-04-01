@@ -1,21 +1,14 @@
-name: Gold AI Signal Bot (Intraday)
+name: Gold AI Signal Bot (Loop Mode)
 
 on:
-  schedule:
-    # primary
-    - cron: "1,16,31,46 * * * *"
-    # backup (scheduler bug'a karşı)
-    - cron: "8,23,38,53 * * * *"
   workflow_dispatch:
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
-    env:
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v6
 
       - name: Setup Python
@@ -23,39 +16,27 @@ jobs:
         with:
           python-version: "3.11"
 
-      # 🔥 DEBUG: trigger kontrolü
-      - name: Debug trigger info
-        run: |
-          echo "EVENT NAME: ${{ github.event_name }}"
-          echo "RUN ID: ${{ github.run_id }}"
-          echo "RUN NUMBER: ${{ github.run_number }}"
-          echo "TIME (UTC): $(date -u)"
-
-      # 🔥 DEBUG: cron heartbeat
-      - name: Debug cron heartbeat
-        run: echo "CRON WORKED $(date -u)"
-
-      - name: Restore bot state
-        uses: actions/cache/restore@v5
-        with:
-          path: .bot_state
-          key: gold-ai-bot-state
-
-      - name: Install dependencies
+      - name: Install deps
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run signal bot
+      - name: Run bot
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           python -u signal_bot.py
 
-      - name: Save bot state
-        if: always()
-        uses: actions/cache/save@v5
-        with:
-          path: .bot_state
-          key: gold-ai-bot-state
+      # ⏳ 15 dakika bekle
+      - name: Sleep 15 min
+        run: sleep 900
+
+      # 🔁 Kendini tekrar tetikle
+      - name: Trigger next run
+        run: |
+          curl -X POST \
+          -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+          -H "Accept: application/vnd.github+json" \
+          https://api.github.com/repos/${{ github.repository }}/actions/workflows/gold_bot.yml/dispatches \
+          -d '{"ref":"main"}'
