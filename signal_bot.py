@@ -3,6 +3,7 @@ import time
 import json
 from io import StringIO
 from pathlib import Path
+from datetime import datetime, timezone
 
 import numpy as np
 import pandas as pd
@@ -38,10 +39,8 @@ def send_telegram(text: str) -> None:
         "text": text,
         "disable_web_page_preview": True,
     }
-
     r = requests.post(url, json=payload, timeout=30)
     print("[TG] status:", r.status_code)
-
     if r.status_code != 200:
         print("[TG] response:", r.text[:500])
         raise RuntimeError(f"Telegram HTTP {r.status_code}")
@@ -70,178 +69,50 @@ def default_state() -> dict:
             "winrate": 0.0,
             "expectancy_r": 0.0,
         },
+        "meta": {
+            "last_daily_signal_date": None,
+            "last_intraday_check_ts": None,
+        },
     }
 
 
 def load_state() -> dict:
-    if STATE_PATH.exists():
-        try:
-            state = json.loads(STATE_PATH.read_text(encoding="utf-8"))
-            if not isinstance(state, dict):
-                return default_state()
-            state.setdefault("trade", {})
-            state.setdefault("journal", [])
-            state.setdefault("stats", default_state()["stats"])
-            return state
-        except Exception:
+    if not STATE_PATH.exists():
+        return default_state()
+    try:
+        state = json.loads(STATE_PATH.read_text(encoding="utf-8"))
+        if not isinstance(state, dict):
             return default_state()
-    return default_state()
+        state.setdefault("trade", {})
+        state.setdefault("journal", [])
+        state.setdefault("stats", default_state()["stats"])
+        state.setdefault("meta", default_state()["meta"])
+        return state
+    except Exception:
+        return default_state()
 
 
 def save_state(state: dict) -> None:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
-    STATE_PATH.write_text(
-        json.dumps(state, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+    STATE_PATH.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 # ============================================================
-# DATA FETCH
+# HTTP SESSION
 # ============================================================
 SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": "Mozilla/5.0"})
-FETCH_PAUSE_S = 0.5
-
-
-def normalize_ohlc_index(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    df.index = pd.to_datetime(df.index).normalize()
-    df = df.sort_index()
-    df = df[~df.index.duplicated(keep="last")]
-    return df
-
-
-def fetch_ohlc_stooq(symbol: str, retries: int = 3, sleep_s: float = 1.5) -> pd.DataFrame:
-    url = f"https://stooq.com/q/d/l/?s={symbol}&i=d"
-    last_err = None
-
-    for attempt in range(1, retries + 1):
-        try:
-            print(f"[DATA][STOOQ] {symbol} attempt {attempt}")
-            time.sleep(FETCH_PAUSE_S)
-            r = SESSION.get(url, timeout=25)
-
-            if r.status_code != 200:
-                raise RuntimeError(f"HTTP {r.status_code}")
-
-            txt = (r.text or "").strip()
-            if "Exceeded the daily hits limit" in txt:
-                raise RuntimeError("Stooq quota exceeded")
-            if len(txt) < 40:
-                raise RuntimeError("Empty CSV")
-
-            df = pd.read_csv(StringIO(txt))
-            needed = {"Date", "Open", "High", "Low", "Close"}
-            if not needed.issubset(df.columns):
-                raise RuntimeError(f"Missing columns: {list(df.columns)}")
-
-            df["Date"] = pd.to_datetime(df["Date"]).dt.normalize()
-            df = df.sort_values("Date").set_index("Date")
-            df = df[["Open", "High", "Low", "Close"]].dropna()
-            df = df[~df.index.duplicated(keep="last")]
-
-            if len(df) < 200:
-                raise RuntimeError(f"Too few rows: {len(df)}")
-
-            print(f"[DATA][STOOQ] {symbol} OK rows={len(df)}")
-            return normalize_ohlc_index(df)
-
-        except Exception as e:
-            last_err = e
-            print(f"[DATA][STOOQ] {symbol} failed: {type(e).__name__}: {str(e)[:200]}")
-            time.sleep(sleep_s)
-
-    raise RuntimeError(f"Stooq failed for {symbol}: {type(last_err).__name__}: {last_err}")
-
-
-def fetch_ohlc_yahoo(symbol: str, retries: int = 3, sleep_s: float = 1.5) -> pd.DataFrame:
-    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?range=10y&interval=1d&includePrePost=false"
-    last_err = None
-
-    for attempt in range(1, retries + 1):
-        try:
-            print(f"[DATA][YAHOO] {symbol} attempt {attempt}")
-            time.sleep(FETCH_PAUSE_S)
-            r = SESSION.get(url, timeout=25)
-            if r.status_code != 200:
-                raise RuntimeError(f"HTTP {r.status_code}")
-
-            data = r.json()
-            result = data.get("chart", {}).get("result")
-            if not result:
-                raise RuntimeError("No Yahoo result")
-
-            result0 = result[0]
-            ts = result0["timestamp"]
-            q = result0["indicators"]["quote"][0]
-
-            df = pd.DataFrame({
-                "Date": pd.to_datetime(ts, unit="s", utc=True).tz_convert(None).normalize(),
-                "Open": q["open"],
-                "High": q["high"],
-                "Low": q["low"],
-                "Close": q["close"],
-            }).dropna()
-
-            df = df.sort_values("Date").set_index("Date")
-            df = df[["Open", "High", "Low", "Close"]]
-            df = df[~df.index.duplicated(keep="last")]
-
-            if len(df) < 200:
-                raise RuntimeError(f"Too few rows: {len(df)}")
-
-            print(f"[DATA][YAHOO] {symbol} OK rows={len(df)}")
-            return normalize_ohlc_index(df)
-
-        except Exception as e:
-            last_err = e
-            print(f"[DATA][YAHOO] {symbol} failed: {type(e).__name__}: {str(e)[:200]}")
-            time.sleep(sleep_s)
-
-    raise RuntimeError(f"Yahoo failed for {symbol}: {type(last_err).__name__}: {last_err}")
-
-
-def fetch_ohlc_with_fallback(name: str, providers: list[tuple[str, str]]) -> tuple[pd.DataFrame, str]:
-    errors = []
-
-    for provider, symbol in providers:
-        try:
-            if provider == "stooq":
-                df = fetch_ohlc_stooq(symbol)
-                return df, f"{provider}:{symbol}"
-            if provider == "yahoo":
-                df = fetch_ohlc_yahoo(symbol)
-                return df, f"{provider}:{symbol}"
-            raise RuntimeError(f"Unknown provider {provider}")
-        except Exception as e:
-            err = f"{provider}:{symbol} -> {type(e).__name__}: {str(e)[:120]}"
-            print(f"[DATA][FALLBACK] {name} {err}")
-            errors.append(err)
-
-    raise RuntimeError(f"{name} fetch failed. " + " | ".join(errors))
+FETCH_PAUSE_S = 0.35
 
 
 # ============================================================
-# SYMBOL MAPS
-# ============================================================
-XAU_PROVIDERS = [("stooq", "xauusd"), ("yahoo", "GC=F")]
-DXY_PROVIDERS = [("stooq", "usd_i"), ("stooq", "usdidx"), ("yahoo", "DX-Y.NYB")]
-US10Y_PROVIDERS = [("stooq", "10yusy.b"), ("stooq", "us10y"), ("yahoo", "^TNX")]
-VIX_PROVIDERS = [("stooq", "vi.f"), ("stooq", "vix"), ("yahoo", "^VIX")]
-SPX_PROVIDERS = [("stooq", "^spx"), ("yahoo", "^GSPC")]
-TIPS_PROVIDERS = [("stooq", "tip.us"), ("yahoo", "TIP")]
-IEF_PROVIDERS = [("stooq", "ief.us"), ("yahoo", "IEF")]
-
-# ============================================================
-# STRATEGY CONFIG
+# CONFIG
 # ============================================================
 TRAIN_DAYS = 252 * 5
 
 TH_LONG = 0.58
 TH_SHORT = 0.42
 MIN_EDGE = 0.08
-
 REAL_BIAS = 0.015
 
 ATR_LEN = 14
@@ -265,7 +136,6 @@ MIN_CHART_SCORE_TO_TRADE = 2
 EXIT_P_ADJ_LONG = 0.50
 EXIT_P_ADJ_SHORT = 0.50
 
-# Retest layer
 ENTRY_MODE_DEFAULT = "RETEST"
 LATE_ENTRY_ATR_FRACTION = 0.25
 RETEST_TOL_PCT = 0.0010
@@ -274,7 +144,6 @@ MIN_REJECTION_BODY_PCT = 0.0015
 MIN_BOUNCE_FROM_LEVEL_ATR = 0.10
 MAX_CLOSE_AWAY_FROM_LEVEL_ATR = 0.35
 
-# Momentum layer
 ENABLE_MOMENTUM_LAYER = True
 MOMENTUM_P_LONG = 0.56
 MOMENTUM_P_SHORT = 0.44
@@ -283,9 +152,57 @@ MOMENTUM_MAX_CLOSE_POS_SHORT = 0.30
 MOMENTUM_BREAKOUT_BUFFER_ATR = 0.05
 MOMENTUM_STOP_ATR_MULT = 1.0
 
+# Intraday execution / management
+INTRADAY_INTERVAL = "5m"
+INTRADAY_RANGE = "5d"
+ENABLE_INTRADAY_EXECUTION = True
+ENABLE_AUTO_MANAGEMENT = True
+BE_AT_R = 0.75
+PARTIAL_AT_R = 1.00
+PARTIAL_CLOSE_FRACTION = 0.50
+TRAIL_ENABLE_AT_R = 1.50
+TRAIL_LOCK_R = 0.80
+MAX_INTRADAY_BARS = 1500
+
 # ============================================================
-# HELPERS
+# SYMBOLS
 # ============================================================
+XAU_PROVIDERS = [("stooq", "xauusd"), ("yahoo", "GC=F")]
+DXY_PROVIDERS = [("stooq", "usd_i"), ("stooq", "usdidx"), ("yahoo", "DX-Y.NYB")]
+US10Y_PROVIDERS = [("stooq", "10yusy.b"), ("stooq", "us10y"), ("yahoo", "^TNX")]
+VIX_PROVIDERS = [("stooq", "vi.f"), ("stooq", "vix"), ("yahoo", "^VIX")]
+SPX_PROVIDERS = [("stooq", "^spx"), ("yahoo", "^GSPC")]
+TIPS_PROVIDERS = [("stooq", "tip.us"), ("yahoo", "TIP")]
+IEF_PROVIDERS = [("stooq", "ief.us"), ("yahoo", "IEF")]
+
+YAHOO_INTRADAY_SYMBOL = "GC=F"
+
+
+# ============================================================
+# UTILS
+# ============================================================
+def now_utc_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def normalize_ohlc_index(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df.index = pd.to_datetime(df.index).normalize()
+    df = df.sort_index()
+    df = df[~df.index.duplicated(keep="last")]
+    return df
+
+
+def round4(x: float | None) -> float | None:
+    if x is None:
+        return None
+    return round(float(x), 4)
+
+
+def clamp01(x: float) -> float:
+    return float(min(0.999, max(0.001, x)))
+
+
 def compute_atr(df: pd.DataFrame, n: int) -> pd.Series:
     prev_close = df["Close"].shift(1)
     tr = pd.concat(
@@ -299,76 +216,11 @@ def compute_atr(df: pd.DataFrame, n: int) -> pd.Series:
     return tr.rolling(n).mean()
 
 
-def clamp01(x: float) -> float:
-    return float(min(0.999, max(0.001, x)))
-
-
-def late_entry_filter(
-    side: str,
-    close_price: float,
-    breakout_level: float,
-    atr: float,
-) -> tuple[bool, str, float]:
-    if atr <= 0 or not np.isfinite(atr):
-        return False, "", 0.0
-
-    if side == "LONG":
-        move = max(0.0, close_price - breakout_level)
-    elif side == "SHORT":
-        move = max(0.0, breakout_level - close_price)
-    else:
-        return False, "", 0.0
-
-    limit = LATE_ENTRY_ATR_FRACTION * atr
-    is_late = move > limit
-    reason = f"late entry: move {move:.2f} > {LATE_ENTRY_ATR_FRACTION:.2f}*ATR ({limit:.2f})" if is_late else ""
-    return is_late, reason, move
-
-
-def build_trade_setup(
-    side: str,
-    y_high: float,
-    y_low: float,
-    atr: float,
-    mode: str,
-) -> tuple[float, float, float, float]:
-    if mode == "RETEST":
-        if side == "LONG":
-            break_level = y_high
-            entry = y_high * (1.0 + HALF_SPREAD)
-            sl = entry - STOP_ATR_MULT * atr
-            tp = entry + RR * (STOP_ATR_MULT * atr)
-        elif side == "SHORT":
-            break_level = y_low
-            entry = y_low * (1.0 - HALF_SPREAD)
-            sl = entry + STOP_ATR_MULT * atr
-            tp = entry - RR * (STOP_ATR_MULT * atr)
-        else:
-            break_level = float("nan")
-            entry = float("nan")
-            sl = float("nan")
-            tp = float("nan")
-        return entry, sl, tp, break_level
-
-    if mode == "MOMENTUM":
-        if side == "LONG":
-            break_level = y_high
-            entry = y_high + (MOMENTUM_BREAKOUT_BUFFER_ATR * atr)
-            sl = entry - MOMENTUM_STOP_ATR_MULT * atr
-            tp = entry + RR * (MOMENTUM_STOP_ATR_MULT * atr)
-        elif side == "SHORT":
-            break_level = y_low
-            entry = y_low - (MOMENTUM_BREAKOUT_BUFFER_ATR * atr)
-            sl = entry + MOMENTUM_STOP_ATR_MULT * atr
-            tp = entry - RR * (MOMENTUM_STOP_ATR_MULT * atr)
-        else:
-            break_level = float("nan")
-            entry = float("nan")
-            sl = float("nan")
-            tp = float("nan")
-        return entry, sl, tp, break_level
-
-    return float("nan"), float("nan"), float("nan"), float("nan")
+def safe_float(v, default=np.nan) -> float:
+    try:
+        return float(v)
+    except Exception:
+        return float(default)
 
 
 def calc_mfe_mae(side: str, entry: float, high: float, low: float) -> tuple[float, float]:
@@ -381,285 +233,150 @@ def calc_mfe_mae(side: str, entry: float, high: float, low: float) -> tuple[floa
     return mfe, mae
 
 
-def update_running_extremes(trade: dict, side: str, high: float, low: float, entry: float) -> dict:
-    mfe_today, mae_today = calc_mfe_mae(side, entry, high, low)
-    trade["max_favorable"] = max(float(trade.get("max_favorable", 0.0) or 0.0), mfe_today)
-    trade["max_adverse"] = max(float(trade.get("max_adverse", 0.0) or 0.0), mae_today)
-    return trade
-
-
-def compute_r_result(result: str, entry: float, stop_dist: float, close_price: float | None = None) -> float:
+def r_multiple(side: str, entry: float, stop_dist: float, price: float) -> float:
     if stop_dist <= 0:
         return 0.0
-    if result == "TAKE_PROFIT":
-        return RR
-    if result == "STOP":
-        return -1.0
-    if result == "BREAKEVEN":
-        return 0.0
-    if result == "CANCELLED":
-        return 0.0
-    if result == "EXIT_NOW" and close_price is not None:
-        return (close_price - entry) / stop_dist
-    return 0.0
-
-
-def refresh_stats(state: dict) -> None:
-    journal = state.get("journal", [])
-    total = 0
-    wins = 0
-    losses = 0
-    breakeven = 0
-    exit_now = 0
-    cancelled = 0
-    sum_r = 0.0
-
-    for j in journal:
-        result = j.get("result")
-        r_mult = float(j.get("r_mult", 0.0) or 0.0)
-
-        if result == "TAKE_PROFIT":
-            wins += 1
-            total += 1
-            sum_r += r_mult
-        elif result == "STOP":
-            losses += 1
-            total += 1
-            sum_r += r_mult
-        elif result == "BREAKEVEN":
-            breakeven += 1
-            total += 1
-            sum_r += r_mult
-        elif result == "EXIT_NOW":
-            exit_now += 1
-            total += 1
-            sum_r += r_mult
-        elif result == "CANCELLED":
-            cancelled += 1
-
-    avg_r = (sum_r / total) if total > 0 else 0.0
-    winrate = (wins / total * 100.0) if total > 0 else 0.0
-
-    state["stats"] = {
-        "total": total,
-        "wins": wins,
-        "losses": losses,
-        "breakeven": breakeven,
-        "exit_now": exit_now,
-        "cancelled": cancelled,
-        "sum_r": round(sum_r, 4),
-        "avg_r": round(avg_r, 4),
-        "winrate": round(winrate, 2),
-        "expectancy_r": round(avg_r, 4),
-    }
-
-
-def add_journal_entry(
-    state: dict,
-    trade: dict,
-    result: str,
-    close_date: str,
-    close_price: float | None = None,
-) -> None:
-    journal = state.setdefault("journal", [])
-
-    entry = float(trade.get("entry", 0.0) or 0.0)
-    stop_dist = float(trade.get("stop_dist", 0.0) or 0.0)
-    r_mult = compute_r_result(result, entry, stop_dist, close_price)
-
-    row = {
-        "created_date": trade.get("created_date"),
-        "open_date": trade.get("open_date"),
-        "close_date": close_date,
-        "side": trade.get("side"),
-        "entry_mode": trade.get("entry_mode"),
-        "grade": trade.get("grade"),
-        "entry": round(entry, 4),
-        "sl": round(float(trade.get("sl_initial", trade.get("sl", 0.0)) or 0.0), 4),
-        "tp": round(float(trade.get("tp", 0.0) or 0.0), 4),
-        "stop_dist": round(stop_dist, 4),
-        "result": result,
-        "close_price": round(float(close_price), 4) if close_price is not None else None,
-        "r_mult": round(r_mult, 4),
-        "max_favorable": round(float(trade.get("max_favorable", 0.0) or 0.0), 4),
-        "max_adverse": round(float(trade.get("max_adverse", 0.0) or 0.0), 4),
-    }
-
-    journal.append(row)
-    state["journal"] = journal[-500:]
-    refresh_stats(state)
-
-
-def stats_text(state: dict) -> str:
-    s = state.get("stats", {})
-    return (
-        f"Trades: {s.get('total', 0)}\n"
-        f"Wins: {s.get('wins', 0)} | Losses: {s.get('losses', 0)} | BE: {s.get('breakeven', 0)} | ExitNow: {s.get('exit_now', 0)}\n"
-        f"WinRate: {float(s.get('winrate', 0.0)):.2f}%\n"
-        f"Avg R: {float(s.get('avg_r', 0.0)):.2f}\n"
-        f"Expectancy: {float(s.get('expectancy_r', 0.0)):.2f}R"
-    )
-
-
-def rejection_filter(
-    side: str,
-    o: float,
-    h: float,
-    l: float,
-    c: float,
-    break_level: float,
-    atr: float,
-) -> tuple[bool, str]:
-    if atr <= 0 or not np.isfinite(atr):
-        return False, "invalid ATR"
-
-    body_abs = abs(c - o)
-    min_body_abs = MIN_REJECTION_BODY_PCT * break_level
-    max_close_away = MAX_CLOSE_AWAY_FROM_LEVEL_ATR * atr
-    min_bounce_abs = MIN_BOUNCE_FROM_LEVEL_ATR * atr
-
-    if side == "SHORT":
-        touched = h >= break_level * (1.0 - RETEST_TOL_PCT)
-        bearish_close = c <= break_level * (1.0 - RETEST_REJECTION_BUFFER_PCT)
-        close_not_too_far = (break_level - c) <= max_close_away
-        bounce_size = max(0.0, h - c)
-        enough_bounce = bounce_size >= min_bounce_abs
-        enough_body = body_abs >= min_body_abs
-        ok = touched and bearish_close and close_not_too_far and enough_bounce and enough_body
-        reason = (
-            f"touched={touched}, bearish_close={bearish_close}, close_not_too_far={close_not_too_far}, "
-            f"enough_bounce={enough_bounce}, enough_body={enough_body}"
-        )
-        return ok, reason
-
     if side == "LONG":
-        touched = l <= break_level * (1.0 + RETEST_TOL_PCT)
-        bullish_close = c >= break_level * (1.0 + RETEST_REJECTION_BUFFER_PCT)
-        close_not_too_far = (c - break_level) <= max_close_away
-        bounce_size = max(0.0, c - l)
-        enough_bounce = bounce_size >= min_bounce_abs
-        enough_body = body_abs >= min_body_abs
-        ok = touched and bullish_close and close_not_too_far and enough_bounce and enough_body
-        reason = (
-            f"touched={touched}, bullish_close={bullish_close}, close_not_too_far={close_not_too_far}, "
-            f"enough_bounce={enough_bounce}, enough_body={enough_body}"
-        )
-        return ok, reason
-
-    return False, "unknown side"
+        return (price - entry) / stop_dist
+    return (entry - price) / stop_dist
 
 
-def momentum_filter(
-    side: str,
-    p_adj: float,
-    trend_up: bool,
-    chart_score: int,
-    close_pos: float,
-    vol_expansion: int,
-    close_now: float,
-    y_high: float,
-    y_low: float,
-    atr: float,
-) -> tuple[bool, str]:
-    if atr <= 0 or not np.isfinite(atr):
-        return False, "invalid ATR"
+# ============================================================
+# FETCHERS
+# ============================================================
+def fetch_ohlc_stooq(symbol: str, retries: int = 3, sleep_s: float = 1.2) -> pd.DataFrame:
+    url = f"https://stooq.com/q/d/l/?s={symbol}&i=d"
+    last_err = None
 
-    if side == "LONG":
-        conds = {
-            "vol_expansion": vol_expansion == 1,
-            "p_adj": p_adj >= MOMENTUM_P_LONG,
-            "close_pos": close_pos >= MOMENTUM_MIN_CLOSE_POS_LONG,
-            "breakout": close_now >= y_high + MOMENTUM_BREAKOUT_BUFFER_ATR * atr,
-        }
-        ok = all(conds.values())
-        return ok, ", ".join([f"{k}={v}" for k, v in conds.items()])
+    for attempt in range(1, retries + 1):
+        try:
+            print(f"[DATA][STOOQ] {symbol} attempt {attempt}")
+            time.sleep(FETCH_PAUSE_S)
+            r = SESSION.get(url, timeout=25)
+            if r.status_code != 200:
+                raise RuntimeError(f"HTTP {r.status_code}")
+            txt = (r.text or "").strip()
+            if "Exceeded the daily hits limit" in txt:
+                raise RuntimeError("Stooq quota exceeded")
+            if len(txt) < 40:
+                raise RuntimeError("Empty CSV")
 
-    if side == "SHORT":
-        conds = {
-            "vol_expansion": vol_expansion == 1,
-            "p_adj": p_adj <= MOMENTUM_P_SHORT,
-            "close_pos": close_pos <= MOMENTUM_MAX_CLOSE_POS_SHORT,
-            "breakout": close_now <= y_low - MOMENTUM_BREAKOUT_BUFFER_ATR * atr,
-        }
-        ok = all(conds.values())
-        return ok, ", ".join([f"{k}={v}" for k, v in conds.items()])
+            df = pd.read_csv(StringIO(txt))
+            needed = {"Date", "Open", "High", "Low", "Close"}
+            if not needed.issubset(df.columns):
+                raise RuntimeError(f"Missing columns: {list(df.columns)}")
 
-    return False, "unknown side"
+            df["Date"] = pd.to_datetime(df["Date"]).dt.normalize()
+            df = df.sort_values("Date").set_index("Date")
+            df = df[["Open", "High", "Low", "Close"]].dropna()
+            df = df[~df.index.duplicated(keep="last")]
+            if len(df) < 200:
+                raise RuntimeError(f"Too few rows: {len(df)}")
+            return normalize_ohlc_index(df)
+
+        except Exception as e:
+            last_err = e
+            print(f"[DATA][STOOQ] {symbol} failed: {type(e).__name__}: {str(e)[:180]}")
+            time.sleep(sleep_s)
+
+    raise RuntimeError(f"Stooq failed for {symbol}: {type(last_err).__name__}: {last_err}")
 
 
-def compute_grade(
-    side: str,
-    p_adj: float,
-    chart_score: int,
-    late_filter_reason: str,
-    rejection_ok: bool,
-    trend_up: bool,
-    real_chg5: float | None,
-    entry_mode: str,
-    momentum_ok: bool,
-) -> tuple[str, list[str]]:
-    reasons: list[str] = []
-    score = 0
+def fetch_ohlc_yahoo(symbol: str, retries: int = 3, sleep_s: float = 1.2) -> pd.DataFrame:
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?range=10y&interval=1d&includePrePost=false"
+    last_err = None
 
-    if side == "NO-TRADE":
-        return "N/A", ["no valid setup"]
+    for attempt in range(1, retries + 1):
+        try:
+            print(f"[DATA][YAHOO] {symbol} attempt {attempt}")
+            time.sleep(FETCH_PAUSE_S)
+            r = SESSION.get(url, timeout=25)
+            if r.status_code != 200:
+                raise RuntimeError(f"HTTP {r.status_code}")
+            data = r.json()
+            result = data.get("chart", {}).get("result")
+            if not result:
+                raise RuntimeError("No Yahoo result")
 
-    if side == "LONG":
-        if trend_up:
-            score += 1
-            reasons.append("trend aligned")
-        if p_adj >= 0.64:
-            score += 2
-            reasons.append("strong AI edge")
-        elif p_adj >= 0.60:
-            score += 1
-            reasons.append("good AI edge")
-        if real_chg5 is not None and np.isfinite(real_chg5) and real_chg5 > 0:
-            score += 1
-            reasons.append("real factor aligned")
+            result0 = result[0]
+            ts = result0["timestamp"]
+            q = result0["indicators"]["quote"][0]
 
-    elif side == "SHORT":
-        if not trend_up:
-            score += 1
-            reasons.append("trend aligned")
-        if p_adj <= 0.36:
-            score += 2
-            reasons.append("strong AI edge")
-        elif p_adj <= 0.40:
-            score += 1
-            reasons.append("good AI edge")
-        if real_chg5 is not None and np.isfinite(real_chg5) and real_chg5 < 0:
-            score += 1
-            reasons.append("real factor aligned")
+            df = pd.DataFrame({
+                "Date": pd.to_datetime(ts, unit="s", utc=True).tz_convert(None).normalize(),
+                "Open": q["open"],
+                "High": q["high"],
+                "Low": q["low"],
+                "Close": q["close"],
+            }).dropna()
 
-    if entry_mode == "RETEST":
-        if chart_score >= 4:
-            score += 2
-            reasons.append("strong chart quality")
-        elif chart_score >= 3:
-            score += 1
-            reasons.append("good chart quality")
-        if rejection_ok:
-            score += 1
-            reasons.append("clean rejection setup")
-        if not late_filter_reason:
-            score += 1
-            reasons.append("not late")
+            df = df.sort_values("Date").set_index("Date")
+            df = df[["Open", "High", "Low", "Close"]]
+            df = df[~df.index.duplicated(keep="last")]
+            if len(df) < 200:
+                raise RuntimeError(f"Too few rows: {len(df)}")
+            return normalize_ohlc_index(df)
 
-    elif entry_mode == "MOMENTUM":
-        if momentum_ok:
-            score += 2
-            reasons.append("momentum expansion setup")
-        if chart_score >= 1:
-            score += 1
-            reasons.append("minimum chart confirmation")
-        reasons.append("trend continuation mode")
+        except Exception as e:
+            last_err = e
+            print(f"[DATA][YAHOO] {symbol} failed: {type(e).__name__}: {str(e)[:180]}")
+            time.sleep(sleep_s)
 
-    if score >= 6:
-        return "A", reasons
-    if score >= 4:
-        return "B", reasons
-    return "C", reasons
+    raise RuntimeError(f"Yahoo failed for {symbol}: {type(last_err).__name__}: {last_err}")
+
+
+def fetch_intraday_yahoo(symbol: str, interval: str = INTRADAY_INTERVAL, range_: str = INTRADAY_RANGE) -> pd.DataFrame:
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?range={range_}&interval={interval}&includePrePost=false"
+    print(f"[DATA][YAHOO][INTRADAY] {symbol} {range_} {interval}")
+    time.sleep(FETCH_PAUSE_S)
+    r = SESSION.get(url, timeout=25)
+    if r.status_code != 200:
+        raise RuntimeError(f"HTTP {r.status_code}")
+
+    data = r.json()
+    result = data.get("chart", {}).get("result")
+    if not result:
+        raise RuntimeError("No Yahoo intraday result")
+
+    result0 = result[0]
+    ts = result0.get("timestamp") or []
+    q = result0["indicators"]["quote"][0]
+    if not ts:
+        raise RuntimeError("Empty intraday timestamps")
+
+    df = pd.DataFrame({
+        "Datetime": pd.to_datetime(ts, unit="s", utc=True).tz_convert(None),
+        "Open": q["open"],
+        "High": q["high"],
+        "Low": q["low"],
+        "Close": q["close"],
+    }).dropna()
+
+    if df.empty:
+        raise RuntimeError("Empty intraday DataFrame")
+
+    df = df.sort_values("Datetime").set_index("Datetime")
+    df = df[["Open", "High", "Low", "Close"]]
+    df = df[~df.index.duplicated(keep="last")]
+    if len(df) > MAX_INTRADAY_BARS:
+        df = df.iloc[-MAX_INTRADAY_BARS:]
+    return df
+
+
+def fetch_ohlc_with_fallback(name: str, providers: list[tuple[str, str]]) -> tuple[pd.DataFrame, str]:
+    errors = []
+    for provider, symbol in providers:
+        try:
+            if provider == "stooq":
+                return fetch_ohlc_stooq(symbol), f"{provider}:{symbol}"
+            if provider == "yahoo":
+                return fetch_ohlc_yahoo(symbol), f"{provider}:{symbol}"
+            raise RuntimeError(f"Unknown provider {provider}")
+        except Exception as e:
+            err = f"{provider}:{symbol} -> {type(e).__name__}: {str(e)[:120]}"
+            print(f"[DATA][FALLBACK] {name} {err}")
+            errors.append(err)
+    raise RuntimeError(f"{name} fetch failed. " + " | ".join(errors))
 
 
 # ============================================================
@@ -839,326 +556,328 @@ def chart_filters(feats: pd.DataFrame, dt: pd.Timestamp, side: str) -> tuple[boo
 
 
 # ============================================================
-# TRACKING / MANAGEMENT
+# SETUP FILTERS
 # ============================================================
-def evaluate_tracking(
-    state: dict,
-    xau_ohlc: pd.DataFrame,
-    feats: pd.DataFrame | None = None,
-    p_up_adj: float | None = None,
-) -> tuple[dict, list[str]]:
-    msgs: list[str] = []
-
-    if len(xau_ohlc) < 3:
-        return state, msgs
-
-    last_bar_date = xau_ohlc.index[-1]
-    bar = xau_ohlc.iloc[-1]
-    o = float(bar["Open"])
-    h = float(bar["High"])
-    l = float(bar["Low"])
-    c = float(bar["Close"])
-
-    t = state.get("trade")
-    if not isinstance(t, dict) or not t:
-        return state, msgs
-
-    if t.get("last_processed_date") == str(last_bar_date.date()):
-        return state, msgs
-
-    status = t.get("status")
-    side = t.get("side")
-    entry = float(t.get("entry", 0.0) or 0.0)
-    sl = float(t.get("sl", 0.0) or 0.0)
-    tp = float(t.get("tp", 0.0) or 0.0)
-    valid_until = t.get("valid_until")
-    stop_dist = float(t.get("stop_dist", 0.0) or 0.0)
-    break_level = float(t.get("break_level", 0.0) or 0.0)
-    entry_mode = str(t.get("entry_mode", ENTRY_MODE_DEFAULT) or ENTRY_MODE_DEFAULT)
-    grade = str(t.get("grade", "N/A"))
-
-    t = update_running_extremes(t, side, h, l, entry)
-    mfe_today, mae_today = calc_mfe_mae(side, entry, h, l)
-
-    if status in ("PENDING", "OPEN"):
-        msgs.append(
-            "📊 DAILY UPDATE\n"
-            f"Date: {last_bar_date.date()}\n"
-            f"Side: {side}\n"
-            f"Grade: {grade}\n"
-            f"Status: {status}\n"
-            f"Mode: {entry_mode}\n"
-            f"Entry: {entry:.2f}\n"
-            f"SL: {sl:.2f}\n"
-            f"TP: {tp:.2f}\n"
-            f"Today High: {h:.2f}\n"
-            f"Today Low: {l:.2f}\n"
-            f"Today Close: {c:.2f}\n"
-            f"MFE(today): {mfe_today:.2f}\n"
-            f"MAE(today): {mae_today:.2f}\n"
-            f"MFE(max): {float(t.get('max_favorable', 0.0)):.2f}\n"
-            f"MAE(max): {float(t.get('max_adverse', 0.0)):.2f}"
-        )
-
-    if status == "PENDING":
-        triggered = False
-        trigger_reason = ""
-
-        if entry_mode == "RETEST":
-            atr_for_trigger = stop_dist / STOP_ATR_MULT if STOP_ATR_MULT > 0 else 0.0
-            reject_ok, reject_reason = rejection_filter(
-                side=side,
-                o=o,
-                h=h,
-                l=l,
-                c=c,
-                break_level=break_level,
-                atr=atr_for_trigger,
-            )
-
-            if side == "LONG":
-                touched_entry = h >= entry
-                if reject_ok and touched_entry:
-                    triggered = True
-                    trigger_reason = f"retest + bullish rejection | {reject_reason}"
-            elif side == "SHORT":
-                touched_entry = l <= entry
-                if reject_ok and touched_entry:
-                    triggered = True
-                    trigger_reason = f"retest + bearish rejection | {reject_reason}"
-
-        elif entry_mode == "MOMENTUM":
-            if side == "LONG" and h >= entry:
-                triggered = True
-                trigger_reason = "momentum breakout continuation"
-            elif side == "SHORT" and l <= entry:
-                triggered = True
-                trigger_reason = "momentum breakdown continuation"
-
-        if triggered:
-            t["status"] = "OPEN"
-            t["open_date"] = str(last_bar_date.date())
-            t["be_moved"] = False
-            msgs.append(
-                "✅ TRADE TRIGGERED\n"
-                f"Date: {last_bar_date.date()}\n"
-                f"Side: {side}\n"
-                f"Grade: {grade}\n"
-                f"Mode: {entry_mode}\n"
-                f"Trigger: {trigger_reason}\n"
-                f"Entry: {entry:.2f}\n"
-                f"SL: {sl:.2f}\n"
-                f"TP: {tp:.2f}"
-            )
-        elif valid_until and str(last_bar_date.date()) >= valid_until:
-            t["status"] = "CANCELLED"
-            t["result"] = "CANCELLED"
-            t["close_date"] = str(last_bar_date.date())
-            add_journal_entry(state, t, "CANCELLED", str(last_bar_date.date()), close_price=c)
-            msgs.append(
-                "⏹️ SETUP CANCELLED\n"
-                f"Date: {last_bar_date.date()}\n"
-                f"Side: {side}\n"
-                f"Grade: {grade}\n"
-                f"Mode: {entry_mode}\n"
-                f"Entry: {entry:.2f}\n\n"
-                + stats_text(state)
-            )
-
-    if t.get("status") == "OPEN":
-        be_moved = bool(t.get("be_moved", False))
-        current_sl = float(t.get("sl", sl) or sl)
-
-        if (not be_moved) and stop_dist > 0:
-            if side == "LONG" and h >= entry + stop_dist:
-                t["sl"] = entry
-                t["be_moved"] = True
-                current_sl = entry
-                msgs.append(
-                    "🟦 MOVE STOP TO BREAK-EVEN\n"
-                    f"Date: {last_bar_date.date()}\n"
-                    f"Side: {side}\n"
-                    f"New SL: {entry:.2f}"
-                )
-            elif side == "SHORT" and l <= entry - stop_dist:
-                t["sl"] = entry
-                t["be_moved"] = True
-                current_sl = entry
-                msgs.append(
-                    "🟦 MOVE STOP TO BREAK-EVEN\n"
-                    f"Date: {last_bar_date.date()}\n"
-                    f"Side: {side}\n"
-                    f"New SL: {entry:.2f}"
-                )
-
-        if feats is not None and p_up_adj is not None and last_bar_date in feats.index:
-            chart_ok, chart_reason, chart_score = chart_filters(feats, last_bar_date, side)
-            exit_now = False
-            exit_reason = ""
-
-            if side == "LONG":
-                if p_up_adj < EXIT_P_ADJ_LONG:
-                    exit_now = True
-                    exit_reason = f"AI weakened (P_adj={p_up_adj:.4f})"
-                elif chart_score < 1 and entry_mode == "RETEST":
-                    exit_now = True
-                    exit_reason = f"Chart weakened ({chart_reason})"
-            elif side == "SHORT":
-                if p_up_adj > EXIT_P_ADJ_SHORT:
-                    exit_now = True
-                    exit_reason = f"AI weakened (P_adj={p_up_adj:.4f})"
-                elif chart_score < 1 and entry_mode == "RETEST":
-                    exit_now = True
-                    exit_reason = f"Chart weakened ({chart_reason})"
-
-            if exit_now:
-                t["status"] = "CLOSED"
-                t["result"] = "EXIT_NOW"
-                t["close_date"] = str(last_bar_date.date())
-                add_journal_entry(state, t, "EXIT_NOW", str(last_bar_date.date()), close_price=c)
-                msgs.append(
-                    "🟨 EXIT NOW\n"
-                    f"Date: {last_bar_date.date()}\n"
-                    f"Side: {side}\n"
-                    f"Grade: {grade}\n"
-                    f"Reason: {exit_reason}\n"
-                    f"Close: {c:.2f}\n\n"
-                    + stats_text(state)
-                )
-
-        if t.get("status") == "OPEN":
-            current_sl = float(t.get("sl", sl) or sl)
-
-            if side == "LONG":
-                hit_sl = l <= current_sl
-                hit_tp = h >= tp
-            else:
-                hit_sl = h >= current_sl
-                hit_tp = l <= tp
-
-            if hit_sl or hit_tp:
-                if hit_sl and hit_tp:
-                    result = "STOP"
-                elif hit_tp:
-                    result = "TAKE_PROFIT"
-                else:
-                    result = "BREAKEVEN" if abs(current_sl - entry) < 1e-9 else "STOP"
-
-                t["status"] = "CLOSED"
-                t["result"] = result
-                t["close_date"] = str(last_bar_date.date())
-
-                close_price_for_journal = tp if result == "TAKE_PROFIT" else current_sl
-                add_journal_entry(state, t, result, str(last_bar_date.date()), close_price=close_price_for_journal)
-
-                emoji = "🟩" if result == "TAKE_PROFIT" else ("⬜" if result == "BREAKEVEN" else "🟥")
-                label = "TAKE PROFIT" if result == "TAKE_PROFIT" else ("BREAK-EVEN" if result == "BREAKEVEN" else "STOP")
-
-                msgs.append(
-                    f"{emoji} TRADE CLOSED ({label})\n"
-                    f"Date: {last_bar_date.date()}\n"
-                    f"Side: {side}\n"
-                    f"Grade: {grade}\n"
-                    f"Entry: {entry:.2f}\n"
-                    f"SL: {current_sl:.2f}\n"
-                    f"TP: {tp:.2f}\n"
-                    f"MFE(max): {float(t.get('max_favorable', 0.0)):.2f}\n"
-                    f"MAE(max): {float(t.get('max_adverse', 0.0)):.2f}\n\n"
-                    + stats_text(state)
-                )
-
-    if t.get("status") in ("CLOSED", "CANCELLED"):
-        state["trade"] = {}
+def late_entry_filter(side: str, close_price: float, breakout_level: float, atr: float) -> tuple[bool, str, float]:
+    if atr <= 0 or not np.isfinite(atr):
+        return False, "", 0.0
+    if side == "LONG":
+        move = max(0.0, close_price - breakout_level)
+    elif side == "SHORT":
+        move = max(0.0, breakout_level - close_price)
     else:
-        t["last_processed_date"] = str(last_bar_date.date())
-        state["trade"] = t
+        return False, "", 0.0
 
-    return state, msgs
+    limit = LATE_ENTRY_ATR_FRACTION * atr
+    is_late = move > limit
+    reason = f"late entry: move {move:.2f} > {LATE_ENTRY_ATR_FRACTION:.2f}*ATR ({limit:.2f})" if is_late else ""
+    return is_late, reason, move
 
 
-# ============================================================
-# MAIN
-# ============================================================
-def main() -> None:
-    state = load_state()
+def rejection_filter(side: str, o: float, h: float, l: float, c: float, break_level: float, atr: float) -> tuple[bool, str]:
+    if atr <= 0 or not np.isfinite(atr):
+        return False, "invalid ATR"
 
-    xau, used_xau = fetch_ohlc_with_fallback("XAU", XAU_PROVIDERS)
-    dxy, used_dxy = fetch_ohlc_with_fallback("DXY", DXY_PROVIDERS)
-    us10y, used_us10y = fetch_ohlc_with_fallback("US10Y", US10Y_PROVIDERS)
-    spx, used_spx = fetch_ohlc_with_fallback("SPX", SPX_PROVIDERS)
-    tips, used_tips = fetch_ohlc_with_fallback("TIPS", TIPS_PROVIDERS)
-    ief, used_ief = fetch_ohlc_with_fallback("IEF", IEF_PROVIDERS)
+    body_abs = abs(c - o)
+    min_body_abs = MIN_REJECTION_BODY_PCT * break_level
+    max_close_away = MAX_CLOSE_AWAY_FROM_LEVEL_ATR * atr
+    min_bounce_abs = MIN_BOUNCE_FROM_LEVEL_ATR * atr
 
-    try:
-        vix, used_vix = fetch_ohlc_with_fallback("VIX", VIX_PROVIDERS)
-        print("[RISK] using VIX")
-    except Exception as e:
-        print("[WARN] VIX unavailable:", str(e)[:300])
-        vix, used_vix = None, None
+    if side == "SHORT":
+        touched = h >= break_level * (1.0 - RETEST_TOL_PCT)
+        bearish_close = c <= break_level * (1.0 - RETEST_REJECTION_BUFFER_PCT)
+        close_not_too_far = (break_level - c) <= max_close_away
+        bounce_size = max(0.0, h - c)
+        enough_bounce = bounce_size >= min_bounce_abs
+        enough_body = body_abs >= min_body_abs
+        ok = touched and bearish_close and close_not_too_far and enough_bounce and enough_body
+        reason = f"touched={touched}, bearish_close={bearish_close}, close_not_too_far={close_not_too_far}, enough_bounce={enough_bounce}, enough_body={enough_body}"
+        return ok, reason
 
-    feats = make_features(xau, dxy, us10y, vix, spx, tips, ief)
+    if side == "LONG":
+        touched = l <= break_level * (1.0 + RETEST_TOL_PCT)
+        bullish_close = c >= break_level * (1.0 + RETEST_REJECTION_BUFFER_PCT)
+        close_not_too_far = (c - break_level) <= max_close_away
+        bounce_size = max(0.0, c - l)
+        enough_bounce = bounce_size >= min_bounce_abs
+        enough_body = body_abs >= min_body_abs
+        ok = touched and bullish_close and close_not_too_far and enough_bounce and enough_body
+        reason = f"touched={touched}, bullish_close={bullish_close}, close_not_too_far={close_not_too_far}, enough_bounce={enough_bounce}, enough_body={enough_body}"
+        return ok, reason
 
-    if len(feats) < TRAIN_DAYS + 10:
-        raise RuntimeError(f"Not enough aligned rows: {len(feats)} need~{TRAIN_DAYS}")
+    return False, "unknown side"
 
-    feature_cols = ["x_ret1", "x_ret3", "x_ret5"]
-    if "dxy_ret1" in feats.columns and "dxy_ret5" in feats.columns:
-        feature_cols += ["dxy_ret1", "dxy_ret5"]
-    if "us10y_chg1" in feats.columns and "us10y_chg5" in feats.columns:
-        feature_cols += ["us10y_chg1", "us10y_chg5"]
-    if "gold_real_mom" in feats.columns:
-        feature_cols += ["gold_real_mom"]
-    if "vix_ret1" in feats.columns and "vix_ret5" in feats.columns:
-        feature_cols += ["vix_ret1", "vix_ret5"]
-    if "spx_ret5" in feats.columns:
-        feature_cols += ["spx_ret5"]
-    if "gold_spx_mom" in feats.columns:
-        feature_cols += ["gold_spx_mom"]
-    if "real_f_chg5" in feats.columns:
-        feature_cols += ["real_f_chg5"]
-    feature_cols += ["trend_up"]
 
-    X = feats[feature_cols]
-    y = feats["y"].astype(int)
+def momentum_filter(
+    side: str,
+    p_adj: float,
+    close_pos: float,
+    vol_expansion: int,
+    close_now: float,
+    y_high: float,
+    y_low: float,
+    atr: float,
+) -> tuple[bool, str]:
+    if atr <= 0 or not np.isfinite(atr):
+        return False, "invalid ATR"
 
-    last_day = feats.index[-1]
-    X_train = X.iloc[-TRAIN_DAYS - 1:-1]
-    y_train = y.iloc[-TRAIN_DAYS - 1:-1]
-    X_last = X.loc[[last_day]]
+    if side == "LONG":
+        conds = {
+            "vol_expansion": vol_expansion == 1,
+            "p_adj": p_adj >= MOMENTUM_P_LONG,
+            "close_pos": close_pos >= MOMENTUM_MIN_CLOSE_POS_LONG,
+            "breakout": close_now >= y_high + MOMENTUM_BREAKOUT_BUFFER_ATR * atr,
+        }
+        return all(conds.values()), ", ".join([f"{k}={v}" for k, v in conds.items()])
 
-    model = Pipeline([
-        ("scaler", StandardScaler()),
-        ("clf", LogisticRegression(max_iter=2000))
-    ])
-    model.fit(X_train, y_train)
+    if side == "SHORT":
+        conds = {
+            "vol_expansion": vol_expansion == 1,
+            "p_adj": p_adj <= MOMENTUM_P_SHORT,
+            "close_pos": close_pos <= MOMENTUM_MAX_CLOSE_POS_SHORT,
+            "breakout": close_now <= y_low - MOMENTUM_BREAKOUT_BUFFER_ATR * atr,
+        }
+        return all(conds.values()), ", ".join([f"{k}={v}" for k, v in conds.items()])
 
-    p_up = float(model.predict_proba(X_last)[:, 1][0])
+    return False, "unknown side"
 
-    real_available = "real_f_chg5" in feats.columns
-    real_chg5 = float(feats.loc[last_day, "real_f_chg5"]) if real_available else float("nan")
 
-    bias = 0.0
-    bias_reason = "RealBias: N/A"
-    if np.isfinite(real_chg5):
-        if real_chg5 > 0:
-            bias = +REAL_BIAS
-            bias_reason = f"RealBias: +{REAL_BIAS:.3f} (real up)"
-        elif real_chg5 < 0:
-            bias = -REAL_BIAS
-            bias_reason = f"RealBias: -{REAL_BIAS:.3f} (real down)"
+def build_trade_setup(side: str, y_high: float, y_low: float, atr: float, mode: str) -> tuple[float, float, float, float]:
+    if mode == "RETEST":
+        if side == "LONG":
+            break_level = y_high
+            entry = y_high * (1.0 + HALF_SPREAD)
+            sl = entry - STOP_ATR_MULT * atr
+            tp = entry + RR * (STOP_ATR_MULT * atr)
+        elif side == "SHORT":
+            break_level = y_low
+            entry = y_low * (1.0 - HALF_SPREAD)
+            sl = entry + STOP_ATR_MULT * atr
+            tp = entry - RR * (STOP_ATR_MULT * atr)
         else:
-            bias_reason = "RealBias: +0.000 (flat)"
+            return np.nan, np.nan, np.nan, np.nan
+        return entry, sl, tp, break_level
 
-    p_adj = clamp01(p_up + bias)
+    if mode == "MOMENTUM":
+        if side == "LONG":
+            break_level = y_high
+            entry = y_high + (MOMENTUM_BREAKOUT_BUFFER_ATR * atr)
+            sl = entry - MOMENTUM_STOP_ATR_MULT * atr
+            tp = entry + RR * (MOMENTUM_STOP_ATR_MULT * atr)
+        elif side == "SHORT":
+            break_level = y_low
+            entry = y_low - (MOMENTUM_BREAKOUT_BUFFER_ATR * atr)
+            sl = entry + MOMENTUM_STOP_ATR_MULT * atr
+            tp = entry - RR * (MOMENTUM_STOP_ATR_MULT * atr)
+        else:
+            return np.nan, np.nan, np.nan, np.nan
+        return entry, sl, tp, break_level
 
-    state, track_msgs = evaluate_tracking(state, xau, feats=feats, p_up_adj=p_adj)
-    for m in track_msgs:
-        send_telegram(m)
+    return np.nan, np.nan, np.nan, np.nan
+
+
+def compute_grade(
+    side: str,
+    p_adj: float,
+    chart_score: int,
+    late_filter_reason: str,
+    rejection_ok: bool,
+    trend_up: bool,
+    real_chg5: float | None,
+    entry_mode: str,
+    momentum_ok: bool,
+) -> tuple[str, list[str]]:
+    reasons: list[str] = []
+    score = 0
+
+    if side == "NO-TRADE":
+        return "N/A", ["no valid setup"]
+
+    if side == "LONG":
+        if trend_up:
+            score += 1
+            reasons.append("trend aligned")
+        if p_adj >= 0.64:
+            score += 2
+            reasons.append("strong AI edge")
+        elif p_adj >= 0.60:
+            score += 1
+            reasons.append("good AI edge")
+        if real_chg5 is not None and np.isfinite(real_chg5) and real_chg5 > 0:
+            score += 1
+            reasons.append("real factor aligned")
+
+    elif side == "SHORT":
+        if not trend_up:
+            score += 1
+            reasons.append("trend aligned")
+        if p_adj <= 0.36:
+            score += 2
+            reasons.append("strong AI edge")
+        elif p_adj <= 0.40:
+            score += 1
+            reasons.append("good AI edge")
+        if real_chg5 is not None and np.isfinite(real_chg5) and real_chg5 < 0:
+            score += 1
+            reasons.append("real factor aligned")
+
+    if entry_mode == "RETEST":
+        if chart_score >= 4:
+            score += 2
+            reasons.append("strong chart quality")
+        elif chart_score >= 3:
+            score += 1
+            reasons.append("good chart quality")
+        if rejection_ok:
+            score += 1
+            reasons.append("clean rejection setup")
+        if not late_filter_reason:
+            score += 1
+            reasons.append("not late")
+
+    elif entry_mode == "MOMENTUM":
+        if momentum_ok:
+            score += 2
+            reasons.append("momentum expansion setup")
+        if chart_score >= 1:
+            score += 1
+            reasons.append("minimum chart confirmation")
+        reasons.append("trend continuation mode")
+
+    if score >= 6:
+        return "A", reasons
+    if score >= 4:
+        return "B", reasons
+    return "C", reasons
+
+
+# ============================================================
+# JOURNAL / STATS
+# ============================================================
+def add_journal_entry(state: dict, trade: dict, result: str, close_date: str, close_price: float | None = None) -> None:
+    journal = state.setdefault("journal", [])
+    entry = safe_float(trade.get("entry"), 0.0)
+    stop_dist = safe_float(trade.get("stop_dist"), 0.0)
+    r_mult = compute_r_result(result, entry, stop_dist, close_price)
+
+    row = {
+        "created_date": trade.get("created_date"),
+        "open_date": trade.get("open_date"),
+        "close_date": close_date,
+        "side": trade.get("side"),
+        "entry_mode": trade.get("entry_mode"),
+        "grade": trade.get("grade"),
+        "entry": round4(entry),
+        "sl": round4(trade.get("sl_initial", trade.get("sl"))),
+        "tp": round4(trade.get("tp")),
+        "stop_dist": round4(stop_dist),
+        "result": result,
+        "close_price": round4(close_price),
+        "r_mult": round4(r_mult),
+        "max_favorable": round4(trade.get("max_favorable", 0.0)),
+        "max_adverse": round4(trade.get("max_adverse", 0.0)),
+        "partial_taken": bool(trade.get("partial_taken", False)),
+        "partial_price": round4(trade.get("partial_price")),
+    }
+
+    journal.append(row)
+    state["journal"] = journal[-500:]
+    refresh_stats(state)
+
+
+def compute_r_result(result: str, entry: float, stop_dist: float, close_price: float | None = None) -> float:
+    if stop_dist <= 0:
+        return 0.0
+    if result == "TAKE_PROFIT":
+        return RR
+    if result == "STOP":
+        return -1.0
+    if result == "BREAKEVEN":
+        return 0.0
+    if result == "CANCELLED":
+        return 0.0
+    if result == "EXIT_NOW" and close_price is not None:
+        return (close_price - entry) / stop_dist
+    return 0.0
+
+
+def refresh_stats(state: dict) -> None:
+    journal = state.get("journal", [])
+    total = 0
+    wins = 0
+    losses = 0
+    breakeven = 0
+    exit_now = 0
+    cancelled = 0
+    sum_r = 0.0
+
+    for j in journal:
+        result = j.get("result")
+        r_mult = float(j.get("r_mult", 0.0) or 0.0)
+        if result == "TAKE_PROFIT":
+            wins += 1
+            total += 1
+            sum_r += r_mult
+        elif result == "STOP":
+            losses += 1
+            total += 1
+            sum_r += r_mult
+        elif result == "BREAKEVEN":
+            breakeven += 1
+            total += 1
+            sum_r += r_mult
+        elif result == "EXIT_NOW":
+            exit_now += 1
+            total += 1
+            sum_r += r_mult
+        elif result == "CANCELLED":
+            cancelled += 1
+
+    avg_r = (sum_r / total) if total > 0 else 0.0
+    winrate = (wins / total * 100.0) if total > 0 else 0.0
+
+    state["stats"] = {
+        "total": total,
+        "wins": wins,
+        "losses": losses,
+        "breakeven": breakeven,
+        "exit_now": exit_now,
+        "cancelled": cancelled,
+        "sum_r": round(sum_r, 4),
+        "avg_r": round(avg_r, 4),
+        "winrate": round(winrate, 2),
+        "expectancy_r": round(avg_r, 4),
+    }
+
+
+def stats_text(state: dict) -> str:
+    s = state.get("stats", {})
+    return (
+        f"Trades: {s.get('total', 0)}\n"
+        f"Wins: {s.get('wins', 0)} | Losses: {s.get('losses', 0)} | BE: {s.get('breakeven', 0)} | ExitNow: {s.get('exit_now', 0)}\n"
+        f"WinRate: {float(s.get('winrate', 0.0)):.2f}%\n"
+        f"Avg R: {float(s.get('avg_r', 0.0)):.2f}\n"
+        f"Expectancy: {float(s.get('expectancy_r', 0.0)):.2f}R"
+    )
+
+
+# ============================================================
+# DAILY SIGNAL ENGINE
+# ============================================================
+def build_daily_signal(state: dict, feats: pd.DataFrame, xau: pd.DataFrame, used_sources: dict) -> tuple[dict, str]:
+    last_day = feats.index[-1]
+    r = feats.loc[last_day]
+
+    p_up = float(used_sources["p_up"])
+    p_adj = float(used_sources["p_adj"])
+    real_chg5 = used_sources["real_chg5"]
+    real_available = used_sources["real_available"]
+    bias_reason = used_sources["bias_reason"]
+    used_vix = used_sources["used_vix"]
 
     trade = state.get("trade", {})
     has_active_trade = trade.get("status") in ("PENDING", "OPEN")
 
-    r = feats.loc[last_day]
     trend_up = int(r["trend_up"]) == 1
     trend_txt = "UP" if trend_up else "DOWN"
     chart_score = 0
@@ -1194,44 +913,31 @@ def main() -> None:
     late_filter_reason = ""
     late_move = 0.0
     rejection_ok = False
-    rejection_reason = ""
     momentum_ok = False
-    momentum_reason = ""
     grade = "N/A"
     grade_reasons: list[str] = []
 
-    # First try RETEST
     if base_side in ("LONG", "SHORT"):
         chart_ok, chart_reason, chart_score = chart_filters(feats, last_day, base_side)
 
         if chart_ok:
-            candidate_entry, candidate_sl, candidate_tp, candidate_break_level = build_trade_setup(
-                base_side, y_high, y_low, atr, "RETEST"
-            )
-
+            c_entry, c_sl, c_tp, c_break = build_trade_setup(base_side, y_high, y_low, atr, "RETEST")
             if base_side == "LONG":
                 is_late, late_filter_reason, late_move = late_entry_filter("LONG", close_now, y_high, atr)
-                rejection_ok, rejection_reason = rejection_filter(
-                    "LONG", today_o, today_h, today_l, today_c, candidate_break_level, atr
-                )
+                rejection_ok, _ = rejection_filter("LONG", today_o, today_h, today_l, today_c, c_break, atr)
             else:
                 is_late, late_filter_reason, late_move = late_entry_filter("SHORT", close_now, y_low, atr)
-                rejection_ok, rejection_reason = rejection_filter(
-                    "SHORT", today_o, today_h, today_l, today_c, candidate_break_level, atr
-                )
+                rejection_ok, _ = rejection_filter("SHORT", today_o, today_h, today_l, today_c, c_break, atr)
 
             if not is_late:
                 side = base_side
                 entry_mode = "RETEST"
-                entry, sl, tp, break_level = candidate_entry, candidate_sl, candidate_tp, candidate_break_level
+                entry, sl, tp, break_level = c_entry, c_sl, c_tp, c_break
 
-    # Then try MOMENTUM if RETEST not found
     if side == "NO-TRADE" and ENABLE_MOMENTUM_LAYER and base_side in ("LONG", "SHORT"):
         momentum_ok, momentum_reason = momentum_filter(
             side=base_side,
             p_adj=p_adj,
-            trend_up=trend_up,
-            chart_score=chart_score,
             close_pos=close_pos,
             vol_expansion=vol_expansion,
             close_now=close_now,
@@ -1243,8 +949,10 @@ def main() -> None:
             side = base_side
             entry_mode = "MOMENTUM"
             entry, sl, tp, break_level = build_trade_setup(base_side, y_high, y_low, atr, "MOMENTUM")
-            late_filter_reason = ""
-            late_move = 0.0
+        else:
+            momentum_reason = momentum_reason
+    else:
+        momentum_reason = ""
 
     if side in ("LONG", "SHORT"):
         grade, grade_reasons = compute_grade(
@@ -1267,13 +975,13 @@ def main() -> None:
         f"GOLD AI SIGNAL (XAUUSD)\n\n"
         f"Date: {last_day.date()}\n\n"
         f"Sources:\n"
-        f"XAU: {used_xau}\n"
-        f"DXY: {used_dxy}\n"
-        f"US10Y: {used_us10y}\n"
+        f"XAU: {used_sources['used_xau']}\n"
+        f"DXY: {used_sources['used_dxy']}\n"
+        f"US10Y: {used_sources['used_us10y']}\n"
         f"VIX: {used_vix if used_vix is not None else 'NONE'}\n"
-        f"SPX: {used_spx}\n"
-        f"TIPS: {used_tips}\n"
-        f"IEF: {used_ief}\n\n"
+        f"SPX: {used_sources['used_spx']}\n"
+        f"TIPS: {used_sources['used_tips']}\n"
+        f"IEF: {used_sources['used_ief']}\n\n"
         f"P(up): {p_up:.4f}\n"
         f"P_adj: {p_adj:.4f} ({bias_reason})\n"
         f"Trend(>MA50): {trend_txt}\n"
@@ -1328,11 +1036,6 @@ def main() -> None:
     if has_active_trade:
         msg += "\nNote: Active trade exists, new setup will NOT be stored.\n"
 
-    print(msg)
-
-    if side != "NO-TRADE" or SEND_NO_TRADE:
-        send_telegram(msg)
-
     if side in ("LONG", "SHORT") and not has_active_trade:
         state["trade"] = {
             "status": "PENDING",
@@ -1348,10 +1051,425 @@ def main() -> None:
             "tp": float(tp),
             "stop_dist": float(stop_dist),
             "be_moved": False,
+            "partial_taken": False,
+            "partial_fraction": PARTIAL_CLOSE_FRACTION,
+            "partial_price": None,
+            "trail_active": False,
+            "trail_sl": None,
             "max_favorable": 0.0,
             "max_adverse": 0.0,
             "last_processed_date": trade.get("last_processed_date"),
+            "last_intraday_bar_ts": None,
+            "opened_via": None,
+            "remaining_size": 1.0,
         }
+
+    state["meta"]["last_daily_signal_date"] = str(last_day.date())
+    return state, msg
+
+
+# ============================================================
+# INTRADAY EXECUTION / MANAGEMENT
+# ============================================================
+def update_trade_extremes_from_intraday(trade: dict, side: str, high: float, low: float, entry: float) -> dict:
+    mfe, mae = calc_mfe_mae(side, entry, high, low)
+    trade["max_favorable"] = max(float(trade.get("max_favorable", 0.0) or 0.0), mfe)
+    trade["max_adverse"] = max(float(trade.get("max_adverse", 0.0) or 0.0), mae)
+    return trade
+
+
+def process_intraday_bars(state: dict, intraday: pd.DataFrame) -> tuple[dict, list[str]]:
+    msgs: list[str] = []
+    trade = state.get("trade", {})
+    if not trade:
+        return state, msgs
+
+    status = trade.get("status")
+    if status not in ("PENDING", "OPEN"):
+        return state, msgs
+
+    side = trade["side"]
+    entry = float(trade["entry"])
+    sl = float(trade["sl"])
+    tp = float(trade["tp"])
+    stop_dist = float(trade["stop_dist"])
+    entry_mode = str(trade.get("entry_mode", ENTRY_MODE_DEFAULT))
+    last_bar_ts = trade.get("last_intraday_bar_ts")
+
+    bars = intraday.copy()
+    if last_bar_ts:
+        bars = bars[bars.index > pd.to_datetime(last_bar_ts)]
+    if bars.empty:
+        return state, msgs
+
+    for ts, row in bars.iterrows():
+        o = float(row["Open"])
+        h = float(row["High"])
+        l = float(row["Low"])
+        c = float(row["Close"])
+
+        trade = update_trade_extremes_from_intraday(trade, side, h, l, entry)
+
+        if trade["status"] == "PENDING":
+            triggered = False
+            if entry_mode == "RETEST":
+                if side == "LONG" and h >= entry:
+                    triggered = True
+                elif side == "SHORT" and l <= entry:
+                    triggered = True
+            elif entry_mode == "MOMENTUM":
+                if side == "LONG" and h >= entry:
+                    triggered = True
+                elif side == "SHORT" and l <= entry:
+                    triggered = True
+
+            if triggered:
+                trade["status"] = "OPEN"
+                trade["open_date"] = str(ts.date())
+                trade["open_ts"] = ts.isoformat()
+                trade["opened_via"] = "INTRADAY"
+                msgs.append(
+                    "✅ TRADE OPENED\n"
+                    f"Time: {ts}\n"
+                    f"Side: {side}\n"
+                    f"Grade: {trade.get('grade','N/A')}\n"
+                    f"Mode: {entry_mode}\n"
+                    f"Entry: {entry:.2f}\n"
+                    f"SL: {trade['sl']:.2f}\n"
+                    f"TP: {trade['tp']:.2f}"
+                )
+
+        if trade["status"] == "OPEN" and ENABLE_AUTO_MANAGEMENT:
+            current_sl = float(trade["sl"])
+            price_for_r = h if side == "LONG" else l
+            current_r = r_multiple(side, entry, stop_dist, price_for_r)
+
+            if (not trade.get("be_moved", False)) and current_r >= BE_AT_R:
+                trade["sl"] = entry
+                trade["be_moved"] = True
+                msgs.append(
+                    "🟦 MOVE STOP TO BREAK-EVEN\n"
+                    f"Time: {ts}\n"
+                    f"Side: {side}\n"
+                    f"New SL: {entry:.2f}\n"
+                    f"Reached: {current_r:.2f}R"
+                )
+                current_sl = entry
+
+            if (not trade.get("partial_taken", False)) and current_r >= PARTIAL_AT_R:
+                trade["partial_taken"] = True
+                trade["partial_price"] = c
+                trade["remaining_size"] = max(0.0, 1.0 - PARTIAL_CLOSE_FRACTION)
+                msgs.append(
+                    "🟨 PARTIAL TAKE PROFIT\n"
+                    f"Time: {ts}\n"
+                    f"Side: {side}\n"
+                    f"Price: {c:.2f}\n"
+                    f"Closed: {PARTIAL_CLOSE_FRACTION:.2f}\n"
+                    f"Remaining: {trade['remaining_size']:.2f}\n"
+                    f"Reached: {current_r:.2f}R"
+                )
+
+            if current_r >= TRAIL_ENABLE_AT_R:
+                trade["trail_active"] = True
+
+            if trade.get("trail_active", False):
+                if side == "LONG":
+                    candidate_trail = entry + (TRAIL_LOCK_R * stop_dist)
+                    if candidate_trail > float(trade["sl"]):
+                        trade["sl"] = candidate_trail
+                        msgs.append(
+                            "🟪 TRAILING STOP UPDATED\n"
+                            f"Time: {ts}\n"
+                            f"Side: {side}\n"
+                            f"New SL: {trade['sl']:.2f}"
+                        )
+                else:
+                    candidate_trail = entry - (TRAIL_LOCK_R * stop_dist)
+                    if candidate_trail < float(trade["sl"]):
+                        trade["sl"] = candidate_trail
+                        msgs.append(
+                            "🟪 TRAILING STOP UPDATED\n"
+                            f"Time: {ts}\n"
+                            f"Side: {side}\n"
+                            f"New SL: {trade['sl']:.2f}"
+                        )
+
+        if trade["status"] == "OPEN":
+            current_sl = float(trade["sl"])
+
+            if side == "LONG":
+                hit_sl = l <= current_sl
+                hit_tp = h >= tp
+            else:
+                hit_sl = h >= current_sl
+                hit_tp = l <= tp
+
+            if hit_sl or hit_tp:
+                if hit_sl and hit_tp:
+                    result = "STOP"
+                elif hit_tp:
+                    result = "TAKE_PROFIT"
+                else:
+                    result = "BREAKEVEN" if abs(current_sl - entry) < 1e-9 else "STOP"
+
+                trade["status"] = "CLOSED"
+                trade["result"] = result
+                trade["close_date"] = str(ts.date())
+                trade["close_ts"] = ts.isoformat()
+
+                close_price_for_journal = tp if result == "TAKE_PROFIT" else current_sl
+                add_journal_entry(state, trade, result, str(ts.date()), close_price=close_price_for_journal)
+
+                emoji = "🟩" if result == "TAKE_PROFIT" else ("⬜" if result == "BREAKEVEN" else "🟥")
+                label = "TAKE PROFIT" if result == "TAKE_PROFIT" else ("BREAK-EVEN" if result == "BREAKEVEN" else "STOP")
+
+                msgs.append(
+                    f"{emoji} TRADE CLOSED ({label})\n"
+                    f"Time: {ts}\n"
+                    f"Side: {side}\n"
+                    f"Grade: {trade.get('grade','N/A')}\n"
+                    f"Entry: {entry:.2f}\n"
+                    f"SL: {current_sl:.2f}\n"
+                    f"TP: {tp:.2f}\n"
+                    f"MFE(max): {float(trade.get('max_favorable',0.0)):.2f}\n"
+                    f"MAE(max): {float(trade.get('max_adverse',0.0)):.2f}\n\n"
+                    + stats_text(state)
+                )
+                break
+
+        trade["last_intraday_bar_ts"] = ts.isoformat()
+
+    if trade.get("status") in ("CLOSED", "CANCELLED"):
+        state["trade"] = {}
+    else:
+        state["trade"] = trade
+
+    state["meta"]["last_intraday_check_ts"] = now_utc_iso()
+    return state, msgs
+
+
+# ============================================================
+# DAILY POSITION REVIEW
+# ============================================================
+def evaluate_daily_open_trade(
+    state: dict,
+    xau_ohlc: pd.DataFrame,
+    feats: pd.DataFrame | None = None,
+    p_up_adj: float | None = None,
+) -> tuple[dict, list[str]]:
+    msgs: list[str] = []
+    if len(xau_ohlc) < 3:
+        return state, msgs
+
+    t = state.get("trade")
+    if not isinstance(t, dict) or not t:
+        return state, msgs
+
+    if t.get("status") not in ("PENDING", "OPEN"):
+        return state, msgs
+
+    last_bar_date = xau_ohlc.index[-1]
+    if t.get("last_processed_date") == str(last_bar_date.date()):
+        return state, msgs
+
+    bar = xau_ohlc.iloc[-1]
+    h = float(bar["High"])
+    l = float(bar["Low"])
+    c = float(bar["Close"])
+
+    side = t["side"]
+    entry = float(t["entry"])
+    sl = float(t["sl"])
+    tp = float(t["tp"])
+    entry_mode = str(t.get("entry_mode", ENTRY_MODE_DEFAULT))
+
+    t = update_trade_extremes_from_intraday(t, side, h, l, entry)
+
+    msgs.append(
+        "📊 DAILY UPDATE\n"
+        f"Date: {last_bar_date.date()}\n"
+        f"Side: {side}\n"
+        f"Grade: {t.get('grade','N/A')}\n"
+        f"Status: {t.get('status')}\n"
+        f"Mode: {entry_mode}\n"
+        f"Entry: {entry:.2f}\n"
+        f"SL: {sl:.2f}\n"
+        f"TP: {tp:.2f}\n"
+        f"Today High: {h:.2f}\n"
+        f"Today Low: {l:.2f}\n"
+        f"Today Close: {c:.2f}\n"
+        f"MFE(max): {float(t.get('max_favorable', 0.0)):.2f}\n"
+        f"MAE(max): {float(t.get('max_adverse', 0.0)):.2f}"
+    )
+
+    if t.get("status") == "PENDING":
+        valid_until = t.get("valid_until")
+        if valid_until and str(last_bar_date.date()) >= valid_until:
+            t["status"] = "CANCELLED"
+            t["result"] = "CANCELLED"
+            t["close_date"] = str(last_bar_date.date())
+            add_journal_entry(state, t, "CANCELLED", str(last_bar_date.date()), close_price=c)
+            msgs.append(
+                "⏹️ SETUP CANCELLED\n"
+                f"Date: {last_bar_date.date()}\n"
+                f"Side: {side}\n"
+                f"Grade: {t.get('grade','N/A')}\n"
+                f"Mode: {entry_mode}\n"
+                f"Entry: {entry:.2f}\n\n"
+                + stats_text(state)
+            )
+            state["trade"] = {}
+            return state, msgs
+
+    if t.get("status") == "OPEN" and feats is not None and p_up_adj is not None and last_bar_date in feats.index:
+        chart_ok, chart_reason, chart_score = chart_filters(feats, last_bar_date, side)
+        exit_now = False
+        exit_reason = ""
+
+        if side == "LONG":
+            if p_up_adj < EXIT_P_ADJ_LONG:
+                exit_now = True
+                exit_reason = f"AI weakened (P_adj={p_up_adj:.4f})"
+            elif chart_score < 1 and t.get("entry_mode") == "RETEST":
+                exit_now = True
+                exit_reason = f"Chart weakened ({chart_reason})"
+        else:
+            if p_up_adj > EXIT_P_ADJ_SHORT:
+                exit_now = True
+                exit_reason = f"AI weakened (P_adj={p_up_adj:.4f})"
+            elif chart_score < 1 and t.get("entry_mode") == "RETEST":
+                exit_now = True
+                exit_reason = f"Chart weakened ({chart_reason})"
+
+        if exit_now:
+            t["status"] = "CLOSED"
+            t["result"] = "EXIT_NOW"
+            t["close_date"] = str(last_bar_date.date())
+            add_journal_entry(state, t, "EXIT_NOW", str(last_bar_date.date()), close_price=c)
+            msgs.append(
+                "🟨 EXIT NOW\n"
+                f"Date: {last_bar_date.date()}\n"
+                f"Side: {side}\n"
+                f"Grade: {t.get('grade','N/A')}\n"
+                f"Reason: {exit_reason}\n"
+                f"Close: {c:.2f}\n\n"
+                + stats_text(state)
+            )
+            state["trade"] = {}
+            return state, msgs
+
+    t["last_processed_date"] = str(last_bar_date.date())
+    state["trade"] = t
+    return state, msgs
+
+
+# ============================================================
+# MAIN
+# ============================================================
+def main() -> None:
+    state = load_state()
+
+    xau, used_xau = fetch_ohlc_with_fallback("XAU", XAU_PROVIDERS)
+    dxy, used_dxy = fetch_ohlc_with_fallback("DXY", DXY_PROVIDERS)
+    us10y, used_us10y = fetch_ohlc_with_fallback("US10Y", US10Y_PROVIDERS)
+    spx, used_spx = fetch_ohlc_with_fallback("SPX", SPX_PROVIDERS)
+    tips, used_tips = fetch_ohlc_with_fallback("TIPS", TIPS_PROVIDERS)
+    ief, used_ief = fetch_ohlc_with_fallback("IEF", IEF_PROVIDERS)
+
+    try:
+        vix, used_vix = fetch_ohlc_with_fallback("VIX", VIX_PROVIDERS)
+        print("[RISK] using VIX")
+    except Exception as e:
+        print("[WARN] VIX unavailable:", str(e)[:250])
+        vix, used_vix = None, None
+
+    feats = make_features(xau, dxy, us10y, vix, spx, tips, ief)
+    if len(feats) < TRAIN_DAYS + 10:
+        raise RuntimeError(f"Not enough aligned rows: {len(feats)} need~{TRAIN_DAYS}")
+
+    feature_cols = ["x_ret1", "x_ret3", "x_ret5"]
+    if "dxy_ret1" in feats.columns and "dxy_ret5" in feats.columns:
+        feature_cols += ["dxy_ret1", "dxy_ret5"]
+    if "us10y_chg1" in feats.columns and "us10y_chg5" in feats.columns:
+        feature_cols += ["us10y_chg1", "us10y_chg5"]
+    if "gold_real_mom" in feats.columns:
+        feature_cols += ["gold_real_mom"]
+    if "vix_ret1" in feats.columns and "vix_ret5" in feats.columns:
+        feature_cols += ["vix_ret1", "vix_ret5"]
+    if "spx_ret5" in feats.columns:
+        feature_cols += ["spx_ret5"]
+    if "gold_spx_mom" in feats.columns:
+        feature_cols += ["gold_spx_mom"]
+    if "real_f_chg5" in feats.columns:
+        feature_cols += ["real_f_chg5"]
+    feature_cols += ["trend_up"]
+
+    X = feats[feature_cols]
+    y = feats["y"].astype(int)
+
+    last_day = feats.index[-1]
+    X_train = X.iloc[-TRAIN_DAYS - 1:-1]
+    y_train = y.iloc[-TRAIN_DAYS - 1:-1]
+    X_last = X.loc[[last_day]]
+
+    model = Pipeline([
+        ("scaler", StandardScaler()),
+        ("clf", LogisticRegression(max_iter=2000)),
+    ])
+    model.fit(X_train, y_train)
+    p_up = float(model.predict_proba(X_last)[:, 1][0])
+
+    real_available = "real_f_chg5" in feats.columns
+    real_chg5 = float(feats.loc[last_day, "real_f_chg5"]) if real_available else float("nan")
+
+    bias = 0.0
+    bias_reason = "RealBias: N/A"
+    if np.isfinite(real_chg5):
+        if real_chg5 > 0:
+            bias = +REAL_BIAS
+            bias_reason = f"RealBias: +{REAL_BIAS:.3f} (real up)"
+        elif real_chg5 < 0:
+            bias = -REAL_BIAS
+            bias_reason = f"RealBias: -{REAL_BIAS:.3f} (real down)"
+        else:
+            bias_reason = "RealBias: +0.000 (flat)"
+
+    p_adj = clamp01(p_up + bias)
+
+    # Daily review for active trade
+    state, daily_track_msgs = evaluate_daily_open_trade(state, xau, feats=feats, p_up_adj=p_adj)
+    for m in daily_track_msgs:
+        send_telegram(m)
+
+    # Intraday execution / management
+    if ENABLE_INTRADAY_EXECUTION and state.get("trade", {}).get("status") in ("PENDING", "OPEN"):
+        try:
+            intraday = fetch_intraday_yahoo(YAHOO_INTRADAY_SYMBOL)
+            state, intraday_msgs = process_intraday_bars(state, intraday)
+            for m in intraday_msgs:
+                send_telegram(m)
+        except Exception as e:
+            print("[INTRADAY] failed:", type(e).__name__, str(e)[:250])
+
+    used_sources = {
+        "used_xau": used_xau,
+        "used_dxy": used_dxy,
+        "used_us10y": used_us10y,
+        "used_vix": used_vix,
+        "used_spx": used_spx,
+        "used_tips": used_tips,
+        "used_ief": used_ief,
+        "p_up": p_up,
+        "p_adj": p_adj,
+        "real_chg5": real_chg5,
+        "real_available": real_available,
+        "bias_reason": bias_reason,
+    }
+
+    state, signal_msg = build_daily_signal(state, feats, xau, used_sources)
+    if SEND_NO_TRADE:
+        send_telegram(signal_msg)
 
     save_state(state)
 
@@ -1367,7 +1485,6 @@ if __name__ == "__main__":
         traceback.print_exc()
         try:
             send_telegram(f"❌ BOT ERROR\n{err}")
-            print("Telegram error message sent.")
         except Exception as tg_err:
-            print("Telegram error send failed:", type(tg_err).__name__, str(tg_err)[:300])
+            print("Telegram error send failed:", type(tg_err).__name__, str(tg_err)[:250])
         raise
