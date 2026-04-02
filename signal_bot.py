@@ -171,13 +171,17 @@ TREND_OVERRIDE_MAX_CLOSE_POS_SHORT = 0.28
 TREND_OVERRIDE_MIN_P_LONG = 0.55
 TREND_OVERRIDE_MAX_P_SHORT = 0.45
 
-# NEW: continuation override
+# Continuation override
 ENABLE_CONTINUATION_OVERRIDE = True
 CONT_SHORT_MAX_P = 0.56
 CONT_LONG_MIN_P = 0.46
 CONT_BREAK_MOVE_ATR = 0.05
 CONT_SHORT_MAX_CLOSE_POS = 0.65
 CONT_LONG_MIN_CLOSE_POS = 0.55
+
+# NEW: live continuation entry
+ENABLE_LIVE_CONTINUATION_ENTRY = True
+LIVE_ENTRY_MAX_ATR = 0.25
 
 # Intraday execution
 ENABLE_INTRADAY_EXECUTION = True
@@ -194,9 +198,7 @@ PARTIAL_CLOSE_FRACTION = 0.50
 TRAIL_ENABLE_AT_R = 1.50
 TRAIL_LOCK_R = 0.80
 
-# ============================================================
-# SYMBOLS (Yahoo first)
-# ============================================================
+# Symbols
 XAU_PROVIDERS = [("yahoo", "GC=F"), ("stooq", "xauusd")]
 DXY_PROVIDERS = [("yahoo", "DX-Y.NYB"), ("stooq", "usd_i"), ("stooq", "usdidx")]
 US10Y_PROVIDERS = [("yahoo", "^TNX"), ("stooq", "10yusy.b"), ("stooq", "us10y")]
@@ -639,6 +641,16 @@ def build_trade_setup(side: str, y_high: float, y_low: float, atr: float, mode: 
     return entry, sl, tp, break_level
 
 
+def recompute_live_trade_setup(side: str, live_entry: float, atr: float) -> tuple[float, float]:
+    if side == "LONG":
+        sl = live_entry - MOMENTUM_STOP_ATR_MULT * atr
+        tp = live_entry + RR * (MOMENTUM_STOP_ATR_MULT * atr)
+    else:
+        sl = live_entry + MOMENTUM_STOP_ATR_MULT * atr
+        tp = live_entry - RR * (MOMENTUM_STOP_ATR_MULT * atr)
+    return sl, tp
+
+
 def late_entry_filter(side: str, price: float, level: float, atr: float) -> tuple[bool, str, float]:
     if not np.isfinite(price) or not np.isfinite(level) or not np.isfinite(atr) or atr <= 0:
         return False, "", 0.0
@@ -736,7 +748,7 @@ def continuation_override(
     if (
         effective_trend == "DOWN"
         and vol_expansion == 1
-        
+        and close_pos <= CONT_SHORT_MAX_CLOSE_POS
         and below_y_low >= CONT_BREAK_MOVE_ATR * atr
         and p_adj <= CONT_SHORT_MAX_P
     ):
@@ -754,6 +766,31 @@ def continuation_override(
     return "NO-TRADE", ""
 
 
+def maybe_use_live_continuation_entry(side: str, entry: float, close_now: float, atr: float) -> tuple[bool, bool, float, str]:
+    """
+    returns:
+    use_live, too_stretched, live_entry, reason
+    """
+    if not ENABLE_LIVE_CONTINUATION_ENTRY or not np.isfinite(entry) or not np.isfinite(close_now) or not np.isfinite(atr) or atr <= 0:
+        return False, False, entry, ""
+
+    max_move = LIVE_ENTRY_MAX_ATR * atr
+
+    if side == "SHORT" and close_now <= entry:
+        move = entry - close_now
+        if move <= max_move:
+            return True, False, close_now, f"live short entry used (move={move:.2f})"
+        return False, True, entry, f"too stretched for live short (move={move:.2f} > {max_move:.2f})"
+
+    if side == "LONG" and close_now >= entry:
+        move = close_now - entry
+        if move <= max_move:
+            return True, False, close_now, f"live long entry used (move={move:.2f})"
+        return False, True, entry, f"too stretched for live long (move={move:.2f} > {max_move:.2f})"
+
+    return False, False, entry, ""
+
+
 # ============================================================
 # GRADE / STATS
 # ============================================================
@@ -769,6 +806,7 @@ def compute_grade(
     momentum_ok: bool,
     late_allow_ok: bool,
     override_reason: str = "",
+    live_entry_reason: str = "",
 ) -> tuple[str, list[str]]:
     reasons: list[str] = []
     score = 0
@@ -833,6 +871,8 @@ def compute_grade(
             score += 1
             reasons.append("minimum chart confirmation")
         reasons.append("trend continuation mode")
+        if live_entry_reason:
+            reasons.append("live continuation entry")
 
     if score >= 6:
         return "A", reasons
@@ -988,6 +1028,8 @@ def build_daily_signal(state: dict, feats: pd.DataFrame, xau: pd.DataFrame, used
     late_allow_ok = False
     late_allow_reason = ""
     override_reason = ""
+    live_entry_reason = ""
+    stale_reason = ""
     grade = "N/A"
     grade_reasons: list[str] = []
     chart_score = 0
@@ -1063,6 +1105,30 @@ def build_daily_signal(state: dict, feats: pd.DataFrame, xau: pd.DataFrame, used
             override_reason = over_reason
             entry, sl, tp, break_level = build_trade_setup(over_side, y_high, y_low, atr, "MOMENTUM")
 
+    # NEW: if momentum/continuation entry is stale, switch to live entry or reject if stretched
+    if side in ("LONG", "SHORT") and entry_mode == "MOMENTUM":
+        use_live, too_stretched, live_entry, live_reason = maybe_use_live_continuation_entry(
+            side=side,
+            entry=entry,
+            close_now=close_now,
+            atr=atr,
+        )
+
+        if too_stretched:
+            stale_reason = live_reason
+            side = "NO-TRADE"
+            grade = "N/A"
+            entry_mode = "MOMENTUM"
+            entry = float(close_now)
+            sl = float("nan")
+            tp = float("nan")
+            break_level = float("nan")
+        elif use_live:
+            entry_mode = "MOMENTUM_LIVE"
+            entry = live_entry
+            sl, tp = recompute_live_trade_setup(side, entry, atr)
+            live_entry_reason = live_reason
+
     if side in ("LONG", "SHORT"):
         grade, grade_reasons = compute_grade(
             side=side,
@@ -1076,6 +1142,7 @@ def build_daily_signal(state: dict, feats: pd.DataFrame, xau: pd.DataFrame, used
             momentum_ok=momentum_ok,
             late_allow_ok=late_allow_ok,
             override_reason=override_reason,
+            live_entry_reason=live_entry_reason,
         )
 
     stop_dist = abs(entry - sl) if np.isfinite(entry) and np.isfinite(sl) else STOP_ATR_MULT * atr
@@ -1099,7 +1166,7 @@ def build_daily_signal(state: dict, feats: pd.DataFrame, xau: pd.DataFrame, used
         f"EffectiveTrend: {effective_trend} ({trend_source})\n"
         f"RiskGate: {risk_gate}\n"
         f"ChartScore: {chart_score}/5\n"
-        f"EntryMode: {entry_mode if side != 'NO-TRADE' else ENTRY_MODE_DEFAULT}\n"
+        f"EntryMode: {entry_mode if side != 'NO-TRADE' else entry_mode}\n"
         f"HasActiveTrade: {has_active_trade}\n"
     )
 
@@ -1117,6 +1184,10 @@ def build_daily_signal(state: dict, feats: pd.DataFrame, xau: pd.DataFrame, used
         msg += f"LateFilter: {late_filter_reason}\n"
     if override_reason:
         msg += f"ContinuationOverride: {override_reason}\n"
+    if live_entry_reason:
+        msg += f"LiveEntry: {live_entry_reason}\n"
+    if stale_reason:
+        msg += f"StaleEntryFilter: {stale_reason}\n"
     if base_side in ("LONG", "SHORT") or override_reason:
         msg += f"RejectionFilter: {'ok' if rejection_ok else 'weak'}\n"
         msg += f"MomentumFilter: {'ok' if momentum_ok else 'weak'}\n"
