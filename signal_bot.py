@@ -17,6 +17,7 @@ from sklearn.preprocessing import StandardScaler
 # ============================================================
 DEBUG_NO_TELEGRAM = False
 SEND_NO_TRADE = True
+SEND_DAILY_SIGNAL_ON_EVERY_RUN = True  # True ise her run'da sinyal mesajı atar
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -39,7 +40,6 @@ def send_telegram(text: str) -> None:
         "text": text,
         "disable_web_page_preview": True,
     }
-
     r = requests.post(url, json=payload, timeout=30)
     print("[TG] status:", r.status_code)
     if r.status_code != 200:
@@ -85,7 +85,6 @@ def load_state() -> dict:
         state = json.loads(STATE_PATH.read_text(encoding="utf-8"))
         if not isinstance(state, dict):
             return default_state()
-
         state.setdefault("trade", {})
         state.setdefault("journal", [])
         state.setdefault("stats", default_state()["stats"])
@@ -97,10 +96,7 @@ def load_state() -> dict:
 
 def save_state(state: dict) -> None:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
-    STATE_PATH.write_text(
-        json.dumps(state, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+    STATE_PATH.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 # ============================================================
@@ -108,7 +104,7 @@ def save_state(state: dict) -> None:
 # ============================================================
 SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": "Mozilla/5.0"})
-FETCH_PAUSE_S = 0.35
+FETCH_PAUSE_S = 0.30
 
 
 # ============================================================
@@ -160,13 +156,22 @@ MOMENTUM_MAX_CLOSE_POS_SHORT = 0.30
 MOMENTUM_BREAKOUT_BUFFER_ATR = 0.05
 MOMENTUM_STOP_ATR_MULT = 1.0
 
-# Smart late-entry allowance for momentum
+# Smart late-entry allowance
 ENABLE_MOMENTUM_LATE_ALLOWANCE = True
-MOMENTUM_LATE_MAX_ATR = 0.60
-MOMENTUM_LATE_MIN_P_LONG = 0.60
-MOMENTUM_LATE_MAX_P_SHORT = 0.40
-MOMENTUM_LATE_MIN_CLOSE_POS_LONG = 0.80
-MOMENTUM_LATE_MAX_CLOSE_POS_SHORT = 0.20
+MOMENTUM_LATE_MAX_ATR = 0.80
+MOMENTUM_LATE_MIN_P_LONG = 0.59
+MOMENTUM_LATE_MAX_P_SHORT = 0.41
+MOMENTUM_LATE_MIN_CLOSE_POS_LONG = 0.78
+MOMENTUM_LATE_MAX_CLOSE_POS_SHORT = 0.22
+
+# Trend override / continuation fix
+EMA_FAST = 20
+EMA_SLOW = 50
+ENABLE_TREND_OVERRIDE = True
+TREND_OVERRIDE_MIN_CLOSE_POS_LONG = 0.72
+TREND_OVERRIDE_MAX_CLOSE_POS_SHORT = 0.28
+TREND_OVERRIDE_MIN_P_LONG = 0.55
+TREND_OVERRIDE_MAX_P_SHORT = 0.45
 
 # Intraday execution
 ENABLE_INTRADAY_EXECUTION = True
@@ -194,8 +199,9 @@ SPX_PROVIDERS = [("stooq", "^spx"), ("yahoo", "^GSPC")]
 TIPS_PROVIDERS = [("stooq", "tip.us"), ("yahoo", "TIP")]
 IEF_PROVIDERS = [("stooq", "ief.us"), ("yahoo", "IEF")]
 
+
 # ============================================================
-# GENERAL HELPERS
+# HELPERS
 # ============================================================
 def now_utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -260,8 +266,24 @@ def r_multiple(side: str, entry: float, stop_dist: float, price: float) -> float
     return (entry - price) / stop_dist
 
 
+def compute_r_result(result: str, entry: float, stop_dist: float, close_price: float | None = None) -> float:
+    if stop_dist <= 0:
+        return 0.0
+    if result == "TAKE_PROFIT":
+        return RR
+    if result == "STOP":
+        return -1.0
+    if result == "BREAKEVEN":
+        return 0.0
+    if result == "CANCELLED":
+        return 0.0
+    if result == "EXIT_NOW" and close_price is not None:
+        return (close_price - entry) / stop_dist
+    return 0.0
+
+
 # ============================================================
-# DATA FETCH
+# FETCHERS
 # ============================================================
 def fetch_ohlc_stooq(symbol: str, retries: int = 3, sleep_s: float = 1.2) -> pd.DataFrame:
     url = f"https://stooq.com/q/d/l/?s={symbol}&i=d"
@@ -290,10 +312,8 @@ def fetch_ohlc_stooq(symbol: str, retries: int = 3, sleep_s: float = 1.2) -> pd.
             df = df.sort_values("Date").set_index("Date")
             df = df[["Open", "High", "Low", "Close"]].dropna()
             df = df[~df.index.duplicated(keep="last")]
-
             if len(df) < 200:
                 raise RuntimeError(f"Too few rows: {len(df)}")
-
             return normalize_ohlc_index(df)
 
         except Exception as e:
@@ -336,10 +356,8 @@ def fetch_ohlc_yahoo(symbol: str, retries: int = 3, sleep_s: float = 1.2) -> pd.
             df = df.sort_values("Date").set_index("Date")
             df = df[["Open", "High", "Low", "Close"]]
             df = df[~df.index.duplicated(keep="last")]
-
             if len(df) < 200:
                 raise RuntimeError(f"Too few rows: {len(df)}")
-
             return normalize_ohlc_index(df)
 
         except Exception as e:
@@ -384,10 +402,8 @@ def fetch_intraday_yahoo(symbol: str, interval: str = INTRADAY_INTERVAL, range_:
     df = df.sort_values("Datetime").set_index("Datetime")
     df = df[["Open", "High", "Low", "Close"]]
     df = df[~df.index.duplicated(keep="last")]
-
     if len(df) > MAX_INTRADAY_BARS:
         df = df.iloc[-MAX_INTRADAY_BARS:]
-
     return df
 
 
@@ -404,349 +420,68 @@ def fetch_ohlc_with_fallback(name: str, providers: list[tuple[str, str]]) -> tup
             err = f"{provider}:{symbol} -> {type(e).__name__}: {str(e)[:120]}"
             print(f"[DATA][FALLBACK] {name} {err}")
             errors.append(err)
-
     raise RuntimeError(f"{name} fetch failed. " + " | ".join(errors))
 
 
 # ============================================================
-# FEATURES
+# TREND / REGIME FIX
 # ============================================================
-def make_features(
-    xau_ohlc: pd.DataFrame,
-    dxy: pd.DataFrame | None,
-    us10y: pd.DataFrame | None,
-    vix: pd.DataFrame | None,
-    spx: pd.DataFrame | None,
-    tips: pd.DataFrame | None,
-    ief: pd.DataFrame | None,
-) -> pd.DataFrame:
-    xau_ohlc = normalize_ohlc_index(xau_ohlc)
+def compute_regime_flags(feats: pd.DataFrame) -> pd.DataFrame:
+    df = feats.copy()
+    df["ema20"] = df["xau"].ewm(span=EMA_FAST, adjust=False).mean()
+    df["ema50"] = df["xau"].ewm(span=EMA_SLOW, adjust=False).mean()
+    df["ema20_up"] = (df["ema20"] > df["ema20"].shift(1)).astype(int)
+    df["ema50_up"] = (df["ema50"] > df["ema50"].shift(1)).astype(int)
+    df["ema_stack_up"] = (df["ema20"] > df["ema50"]).astype(int)
+    df["ema_stack_down"] = (df["ema20"] < df["ema50"]).astype(int)
 
-    series = [xau_ohlc["Close"].rename("xau")]
-    if dxy is not None:
-        series.append(normalize_ohlc_index(dxy)["Close"].rename("dxy"))
-    if us10y is not None:
-        series.append(normalize_ohlc_index(us10y)["Close"].rename("us10y"))
-    if vix is not None:
-        series.append(normalize_ohlc_index(vix)["Close"].rename("vix"))
-    if spx is not None:
-        series.append(normalize_ohlc_index(spx)["Close"].rename("spx"))
-    if tips is not None:
-        series.append(normalize_ohlc_index(tips)["Close"].rename("tips"))
-    if ief is not None:
-        series.append(normalize_ohlc_index(ief)["Close"].rename("ief"))
-
-    df = pd.concat(series, axis=1).dropna()
-    df = df[~df.index.duplicated(keep="last")]
-
-    df = df.join(
-        xau_ohlc[["Open", "High", "Low"]].rename(
-            columns={"Open": "open_xau", "High": "high_xau", "Low": "low_xau"}
-        ),
-        how="left",
-    )
-
-    df["x_ret1"] = np.log(df["xau"]).diff()
-    df["x_ret3"] = np.log(df["xau"]).diff(3)
-    df["x_ret5"] = np.log(df["xau"]).diff(5)
-
-    if "dxy" in df.columns:
-        df["dxy_ret1"] = np.log(df["dxy"]).diff()
-        df["dxy_ret5"] = np.log(df["dxy"]).diff(5)
-
-    if "us10y" in df.columns:
-        df["us10y_chg1"] = df["us10y"].diff()
-        df["us10y_chg5"] = df["us10y"].diff(5)
-        df["gold_real_spread"] = np.log(df["xau"] / df["us10y"].replace(0, np.nan))
-        df["gold_real_mom"] = df["gold_real_spread"].diff(5)
-
-    if "vix" in df.columns:
-        df["vix_ret1"] = np.log(df["vix"]).diff()
-        df["vix_ret5"] = np.log(df["vix"]).diff(5)
-
-    if "spx" in df.columns:
-        df["spx_ret5"] = np.log(df["spx"]).diff(5)
-        df["gold_spx_spread"] = np.log(df["xau"] / df["spx"].replace(0, np.nan))
-        df["gold_spx_mom"] = df["gold_spx_spread"].diff(5)
-
-    if "tips" in df.columns and "ief" in df.columns:
-        df["real_factor"] = np.log(df["tips"] / df["ief"])
-        df["real_f_chg5"] = df["real_factor"].diff(5)
-
-    atr14 = compute_atr(xau_ohlc, ATR_LEN).rename("atr14")
-    atr20 = compute_atr(xau_ohlc, ATR_SLOW_LEN).rename("atr20")
-    df = df.join(atr14, how="left")
-    df = df.join(atr20, how="left")
-
-    df["ma50"] = df["xau"].rolling(50).mean()
-    df["trend_up"] = (df["xau"] > df["ma50"]).astype(int)
-
-    h = df["high_xau"]
-    l = df["low_xau"]
-    o = df["open_xau"]
-    c = df["xau"]
-
-    prev_high_max = h.shift(1).rolling(STRUCT_LOOKBACK).max()
-    prev_low_min = l.shift(1).rolling(STRUCT_LOOKBACK).min()
-
-    df["hh"] = (h > prev_high_max).astype(int)
-    df["hl"] = (l > prev_low_min).astype(int)
-    df["ll"] = (l < prev_low_min).astype(int)
-    df["lh"] = (h < prev_high_max).astype(int)
-
-    body = (c - o).abs()
-    rng = (h - l).replace(0, np.nan)
-    upper_wick = h - pd.concat([o, c], axis=1).max(axis=1)
-    lower_wick = pd.concat([o, c], axis=1).min(axis=1) - l
-
-    df["close_pos"] = ((c - l) / rng).clip(0, 1)
-    df["upper_wick_body"] = (upper_wick / body.replace(0, np.nan)).replace([np.inf, -np.inf], np.nan)
-    df["lower_wick_body"] = (lower_wick / body.replace(0, np.nan)).replace([np.inf, -np.inf], np.nan)
-
-    atr20_med = df["atr20"].rolling(SQUEEZE_LOOKBACK).median()
-    df["atr_ratio"] = df["atr14"] / atr20_med
-    df["squeeze_on"] = (df["atr_ratio"] < SQUEEZE_RATIO_MAX).astype(int)
-    df["vol_expansion"] = (
-        (df["atr_ratio"] > VOL_EXPANSION_RATIO_MIN) &
-        ((df["atr_ratio"] - df["atr_ratio"].shift(1)) > VOL_EXPANSION_MIN_DELTA)
+    # Continuation override
+    df["trend_override_up"] = (
+        (df["vol_expansion"] == 1) &
+        (df["close_pos"] >= TREND_OVERRIDE_MIN_CLOSE_POS_LONG) &
+        ((df["hh"] == 1) | (df["hl"] == 1) | (df["ema20_up"] == 1))
     ).astype(int)
 
-    df["y"] = (df["xau"].shift(-1) > df["xau"]).astype(int)
+    df["trend_override_down"] = (
+        (df["vol_expansion"] == 1) &
+        (df["close_pos"] <= TREND_OVERRIDE_MAX_CLOSE_POS_SHORT) &
+        ((df["ll"] == 1) | (df["lh"] == 1) | (df["ema20_up"] == 0))
+    ).astype(int)
 
-    df = df.dropna()
-    df = df[~df.index.duplicated(keep="last")]
     return df
 
 
-def chart_filters(feats: pd.DataFrame, dt: pd.Timestamp, side: str) -> tuple[bool, str, int]:
-    r = feats.loc[dt]
-    score = 0
-    reasons = []
+def detect_effective_trend(r: pd.Series, p_adj: float) -> tuple[str, str]:
+    base_trend = "UP" if int(r["trend_up"]) == 1 else "DOWN"
 
-    if side == "LONG":
-        structure_ok = (int(r["trend_up"]) == 1) and (int(r["hh"]) == 1 or int(r["hl"]) == 1)
-        close_quality = float(r["close_pos"]) >= (1.0 - CLOSE_NEAR_EXTREME_PCT)
-        fake_breakout = np.isfinite(r["upper_wick_body"]) and float(r["upper_wick_body"]) > WICK_TO_BODY_FAKE
-        wick_ok = (not np.isfinite(r["upper_wick_body"])) or float(r["upper_wick_body"]) <= WICK_TO_BODY_FAKE
-        squeeze_bonus = int(r["squeeze_on"]) == 1
-        vol_expansion_bonus = int(r["vol_expansion"]) == 1
+    if not ENABLE_TREND_OVERRIDE:
+        return base_trend, "ma50"
 
-        if structure_ok:
-            score += 1
-        else:
-            reasons.append("weak market structure")
-        if close_quality:
-            score += 1
-        else:
-            reasons.append("close not near high")
-        if wick_ok:
-            score += 1
-        else:
-            reasons.append("upper wick too large / fake breakout")
-        if squeeze_bonus:
-            score += 1
-        if vol_expansion_bonus:
-            score += 1
+    if (
+        int(r.get("trend_override_up", 0)) == 1 and
+        p_adj >= TREND_OVERRIDE_MIN_P_LONG
+    ):
+        return "UP", "override_up"
 
-        passed = (score >= MIN_CHART_SCORE_TO_TRADE) and (not fake_breakout)
+    if (
+        int(r.get("trend_override_down", 0)) == 1 and
+        p_adj <= TREND_OVERRIDE_MAX_P_SHORT
+    ):
+        return "DOWN", "override_down"
 
-    else:
-        structure_ok = (int(r["trend_up"]) == 0) and (int(r["ll"]) == 1 or int(r["lh"]) == 1)
-        close_quality = float(r["close_pos"]) <= CLOSE_NEAR_EXTREME_PCT
-        fake_breakout = np.isfinite(r["lower_wick_body"]) and float(r["lower_wick_body"]) > WICK_TO_BODY_FAKE
-        wick_ok = (not np.isfinite(r["lower_wick_body"])) or float(r["lower_wick_body"]) <= WICK_TO_BODY_FAKE
-        squeeze_bonus = int(r["squeeze_on"]) == 1
-        vol_expansion_bonus = int(r["vol_expansion"]) == 1
-
-        if structure_ok:
-            score += 1
-        else:
-            reasons.append("weak market structure")
-        if close_quality:
-            score += 1
-        else:
-            reasons.append("close not near low")
-        if wick_ok:
-            score += 1
-        else:
-            reasons.append("lower wick too large / fake breakout")
-        if squeeze_bonus:
-            score += 1
-        if vol_expansion_bonus:
-            score += 1
-
-        passed = (score >= MIN_CHART_SCORE_TO_TRADE) and (not fake_breakout)
-
-    reason = "ok" if passed else "; ".join(reasons[:3]) if reasons else "score too low"
-    return passed, reason, score
+    return base_trend, "ma50"
 
 
 # ============================================================
-# SETUP HELPERS
+# GRADE
 # ============================================================
-def late_entry_filter(side: str, close_price: float, breakout_level: float, atr: float) -> tuple[bool, str, float]:
-    if atr <= 0 or not np.isfinite(atr):
-        return False, "", 0.0
-
-    if side == "LONG":
-        move = max(0.0, close_price - breakout_level)
-    elif side == "SHORT":
-        move = max(0.0, breakout_level - close_price)
-    else:
-        return False, "", 0.0
-
-    limit = LATE_ENTRY_ATR_FRACTION * atr
-    is_late = move > limit
-    reason = f"late entry: move {move:.2f} > {LATE_ENTRY_ATR_FRACTION:.2f}*ATR ({limit:.2f})" if is_late else ""
-    return is_late, reason, move
-
-
-def rejection_filter(side: str, o: float, h: float, l: float, c: float, break_level: float, atr: float) -> tuple[bool, str]:
-    if atr <= 0 or not np.isfinite(atr):
-        return False, "invalid ATR"
-
-    body_abs = abs(c - o)
-    min_body_abs = MIN_REJECTION_BODY_PCT * break_level
-    max_close_away = MAX_CLOSE_AWAY_FROM_LEVEL_ATR * atr
-    min_bounce_abs = MIN_BOUNCE_FROM_LEVEL_ATR * atr
-
-    if side == "SHORT":
-        touched = h >= break_level * (1.0 - RETEST_TOL_PCT)
-        bearish_close = c <= break_level * (1.0 - RETEST_REJECTION_BUFFER_PCT)
-        close_not_too_far = (break_level - c) <= max_close_away
-        bounce_size = max(0.0, h - c)
-        enough_bounce = bounce_size >= min_bounce_abs
-        enough_body = body_abs >= min_body_abs
-        ok = touched and bearish_close and close_not_too_far and enough_bounce and enough_body
-        reason = f"touched={touched}, bearish_close={bearish_close}, close_not_too_far={close_not_too_far}, enough_bounce={enough_bounce}, enough_body={enough_body}"
-        return ok, reason
-
-    if side == "LONG":
-        touched = l <= break_level * (1.0 + RETEST_TOL_PCT)
-        bullish_close = c >= break_level * (1.0 + RETEST_REJECTION_BUFFER_PCT)
-        close_not_too_far = (c - break_level) <= max_close_away
-        bounce_size = max(0.0, c - l)
-        enough_bounce = bounce_size >= min_bounce_abs
-        enough_body = body_abs >= min_body_abs
-        ok = touched and bullish_close and close_not_too_far and enough_bounce and enough_body
-        reason = f"touched={touched}, bullish_close={bullish_close}, close_not_too_far={close_not_too_far}, enough_bounce={enough_bounce}, enough_body={enough_body}"
-        return ok, reason
-
-    return False, "unknown side"
-
-
-def momentum_filter(
-    side: str,
-    p_adj: float,
-    close_pos: float,
-    vol_expansion: int,
-    close_now: float,
-    y_high: float,
-    y_low: float,
-    atr: float,
-) -> tuple[bool, str]:
-    if atr <= 0 or not np.isfinite(atr):
-        return False, "invalid ATR"
-
-    if side == "LONG":
-        conds = {
-            "vol_expansion": vol_expansion == 1,
-            "p_adj": p_adj >= MOMENTUM_P_LONG,
-            "close_pos": close_pos >= MOMENTUM_MIN_CLOSE_POS_LONG,
-            "breakout": close_now >= y_high + MOMENTUM_BREAKOUT_BUFFER_ATR * atr,
-        }
-        return all(conds.values()), ", ".join([f"{k}={v}" for k, v in conds.items()])
-
-    if side == "SHORT":
-        conds = {
-            "vol_expansion": vol_expansion == 1,
-            "p_adj": p_adj <= MOMENTUM_P_SHORT,
-            "close_pos": close_pos <= MOMENTUM_MAX_CLOSE_POS_SHORT,
-            "breakout": close_now <= y_low - MOMENTUM_BREAKOUT_BUFFER_ATR * atr,
-        }
-        return all(conds.values()), ", ".join([f"{k}={v}" for k, v in conds.items()])
-
-    return False, "unknown side"
-
-
-def momentum_late_allowance(
-    side: str,
-    p_adj: float,
-    close_pos: float,
-    vol_expansion: int,
-    late_move: float,
-    atr: float,
-) -> tuple[bool, str]:
-    if not ENABLE_MOMENTUM_LATE_ALLOWANCE:
-        return False, "disabled"
-
-    if atr <= 0 or not np.isfinite(atr):
-        return False, "invalid ATR"
-
-    move_atr = late_move / atr
-
-    if side == "LONG":
-        ok = (
-            vol_expansion == 1 and
-            p_adj >= MOMENTUM_LATE_MIN_P_LONG and
-            close_pos >= MOMENTUM_LATE_MIN_CLOSE_POS_LONG and
-            move_atr <= MOMENTUM_LATE_MAX_ATR
-        )
-        return ok, f"late_move_atr={move_atr:.2f}, vol_expansion={vol_expansion}, p_adj={p_adj:.4f}, close_pos={close_pos:.2f}"
-
-    if side == "SHORT":
-        ok = (
-            vol_expansion == 1 and
-            p_adj <= MOMENTUM_LATE_MAX_P_SHORT and
-            close_pos <= MOMENTUM_LATE_MAX_CLOSE_POS_SHORT and
-            move_atr <= MOMENTUM_LATE_MAX_ATR
-        )
-        return ok, f"late_move_atr={move_atr:.2f}, vol_expansion={vol_expansion}, p_adj={p_adj:.4f}, close_pos={close_pos:.2f}"
-
-    return False, "unknown side"
-
-
-def build_trade_setup(side: str, y_high: float, y_low: float, atr: float, mode: str) -> tuple[float, float, float, float]:
-    if mode == "RETEST":
-        if side == "LONG":
-            break_level = y_high
-            entry = y_high * (1.0 + HALF_SPREAD)
-            sl = entry - STOP_ATR_MULT * atr
-            tp = entry + RR * (STOP_ATR_MULT * atr)
-        elif side == "SHORT":
-            break_level = y_low
-            entry = y_low * (1.0 - HALF_SPREAD)
-            sl = entry + STOP_ATR_MULT * atr
-            tp = entry - RR * (STOP_ATR_MULT * atr)
-        else:
-            return np.nan, np.nan, np.nan, np.nan
-        return entry, sl, tp, break_level
-
-    if mode == "MOMENTUM":
-        if side == "LONG":
-            break_level = y_high
-            entry = y_high + (MOMENTUM_BREAKOUT_BUFFER_ATR * atr)
-            sl = entry - MOMENTUM_STOP_ATR_MULT * atr
-            tp = entry + RR * (MOMENTUM_STOP_ATR_MULT * atr)
-        elif side == "SHORT":
-            break_level = y_low
-            entry = y_low - (MOMENTUM_BREAKOUT_BUFFER_ATR * atr)
-            sl = entry + MOMENTUM_STOP_ATR_MULT * atr
-            tp = entry - RR * (MOMENTUM_STOP_ATR_MULT * atr)
-        else:
-            return np.nan, np.nan, np.nan, np.nan
-        return entry, sl, tp, break_level
-
-    return np.nan, np.nan, np.nan, np.nan
-
-
 def compute_grade(
     side: str,
     p_adj: float,
     chart_score: int,
     late_filter_reason: str,
     rejection_ok: bool,
-    trend_up: bool,
+    effective_trend: str,
     real_chg5: float | None,
     entry_mode: str,
     momentum_ok: bool,
@@ -759,7 +494,7 @@ def compute_grade(
         return "N/A", ["no valid setup"]
 
     if side == "LONG":
-        if trend_up:
+        if effective_trend == "UP":
             score += 1
             reasons.append("trend aligned")
         if p_adj >= 0.64:
@@ -772,7 +507,7 @@ def compute_grade(
             score += 1
             reasons.append("real factor aligned")
     else:
-        if not trend_up:
+        if effective_trend == "DOWN":
             score += 1
             reasons.append("trend aligned")
         if p_adj <= 0.36:
@@ -819,32 +554,42 @@ def compute_grade(
 
 
 # ============================================================
-# JOURNAL / STATS
+# STATS / JOURNAL
 # ============================================================
-def compute_r_result(result: str, entry: float, stop_dist: float, close_price: float | None = None) -> float:
-    if stop_dist <= 0:
-        return 0.0
-    if result == "TAKE_PROFIT":
-        return RR
-    if result == "STOP":
-        return -1.0
-    if result == "BREAKEVEN":
-        return 0.0
-    if result == "CANCELLED":
-        return 0.0
-    if result == "EXIT_NOW" and close_price is not None:
-        return (close_price - entry) / stop_dist
-    return 0.0
+def add_journal_entry(state: dict, trade: dict, result: str, close_date: str, close_price: float | None = None) -> None:
+    journal = state.setdefault("journal", [])
+    entry = safe_float(trade.get("entry"), 0.0)
+    stop_dist = safe_float(trade.get("stop_dist"), 0.0)
+    r_mult = compute_r_result(result, entry, stop_dist, close_price)
+
+    row = {
+        "created_date": trade.get("created_date"),
+        "open_date": trade.get("open_date"),
+        "close_date": close_date,
+        "side": trade.get("side"),
+        "entry_mode": trade.get("entry_mode"),
+        "grade": trade.get("grade"),
+        "entry": round4(entry),
+        "sl": round4(trade.get("sl_initial", trade.get("sl"))),
+        "tp": round4(trade.get("tp")),
+        "stop_dist": round4(stop_dist),
+        "result": result,
+        "close_price": round4(close_price),
+        "r_mult": round4(r_mult),
+        "max_favorable": round4(trade.get("max_favorable", 0.0)),
+        "max_adverse": round4(trade.get("max_adverse", 0.0)),
+        "partial_taken": bool(trade.get("partial_taken", False)),
+        "partial_price": round4(trade.get("partial_price")),
+    }
+
+    journal.append(row)
+    state["journal"] = journal[-500:]
+    refresh_stats(state)
 
 
 def refresh_stats(state: dict) -> None:
     journal = state.get("journal", [])
-    total = 0
-    wins = 0
-    losses = 0
-    breakeven = 0
-    exit_now = 0
-    cancelled = 0
+    total = wins = losses = breakeven = exit_now = cancelled = 0
     sum_r = 0.0
 
     for j in journal:
@@ -886,38 +631,6 @@ def refresh_stats(state: dict) -> None:
     }
 
 
-def add_journal_entry(state: dict, trade: dict, result: str, close_date: str, close_price: float | None = None) -> None:
-    journal = state.setdefault("journal", [])
-
-    entry = safe_float(trade.get("entry"), 0.0)
-    stop_dist = safe_float(trade.get("stop_dist"), 0.0)
-    r_mult = compute_r_result(result, entry, stop_dist, close_price)
-
-    row = {
-        "created_date": trade.get("created_date"),
-        "open_date": trade.get("open_date"),
-        "close_date": close_date,
-        "side": trade.get("side"),
-        "entry_mode": trade.get("entry_mode"),
-        "grade": trade.get("grade"),
-        "entry": round4(entry),
-        "sl": round4(trade.get("sl_initial", trade.get("sl"))),
-        "tp": round4(trade.get("tp")),
-        "stop_dist": round4(stop_dist),
-        "result": result,
-        "close_price": round4(close_price),
-        "r_mult": round4(r_mult),
-        "max_favorable": round4(trade.get("max_favorable", 0.0)),
-        "max_adverse": round4(trade.get("max_adverse", 0.0)),
-        "partial_taken": bool(trade.get("partial_taken", False)),
-        "partial_price": round4(trade.get("partial_price")),
-    }
-
-    journal.append(row)
-    state["journal"] = journal[-500:]
-    refresh_stats(state)
-
-
 def stats_text(state: dict) -> str:
     s = state.get("stats", {})
     return (
@@ -927,16 +640,6 @@ def stats_text(state: dict) -> str:
         f"Avg R: {float(s.get('avg_r', 0.0)):.2f}\n"
         f"Expectancy: {float(s.get('expectancy_r', 0.0)):.2f}R"
     )
-
-
-# ============================================================
-# TRADE EXTREMES
-# ============================================================
-def update_trade_extremes(trade: dict, side: str, high: float, low: float, entry: float) -> dict:
-    mfe, mae = calc_mfe_mae(side, entry, high, low)
-    trade["max_favorable"] = max(float(trade.get("max_favorable", 0.0) or 0.0), mfe)
-    trade["max_adverse"] = max(float(trade.get("max_adverse", 0.0) or 0.0), mae)
-    return trade
 
 
 # ============================================================
@@ -956,8 +659,8 @@ def build_daily_signal(state: dict, feats: pd.DataFrame, xau: pd.DataFrame, used
     trade = state.get("trade", {})
     has_active_trade = trade.get("status") in ("PENDING", "OPEN")
 
-    trend_up = int(r["trend_up"]) == 1
-    trend_txt = "UP" if trend_up else "DOWN"
+    base_trend = "UP" if int(r["trend_up"]) == 1 else "DOWN"
+    effective_trend, trend_source = detect_effective_trend(r, p_adj)
 
     close_now = float(xau["Close"].iloc[-1])
     today_bar = xau.iloc[-1]
@@ -980,6 +683,14 @@ def build_daily_signal(state: dict, feats: pd.DataFrame, xau: pd.DataFrame, used
     elif (p_adj < TH_SHORT) and ((0.5 - p_adj) >= MIN_EDGE):
         base_side = "SHORT"
 
+    # Trend alignment now uses effective trend, not only MA50
+    if base_side == "LONG" and effective_trend != "UP":
+        if not (ENABLE_MOMENTUM_LAYER and vol_expansion == 1 and p_adj >= MOMENTUM_P_LONG):
+            base_side = "NO-TRADE"
+    if base_side == "SHORT" and effective_trend != "DOWN":
+        if not (ENABLE_MOMENTUM_LAYER and vol_expansion == 1 and p_adj <= MOMENTUM_P_SHORT):
+            base_side = "NO-TRADE"
+
     side = "NO-TRADE"
     entry_mode = ENTRY_MODE_DEFAULT
     entry = float(close_now)
@@ -998,10 +709,10 @@ def build_daily_signal(state: dict, feats: pd.DataFrame, xau: pd.DataFrame, used
     chart_reason = ""
     momentum_reason = ""
 
-    # 1) RETEST
     if base_side in ("LONG", "SHORT"):
         chart_ok, chart_reason, chart_score = chart_filters(feats, last_day, base_side)
 
+        # RETEST
         if chart_ok:
             c_entry, c_sl, c_tp, c_break = build_trade_setup(base_side, y_high, y_low, atr, "RETEST")
             if base_side == "LONG":
@@ -1016,7 +727,7 @@ def build_daily_signal(state: dict, feats: pd.DataFrame, xau: pd.DataFrame, used
                 entry_mode = "RETEST"
                 entry, sl, tp, break_level = c_entry, c_sl, c_tp, c_break
 
-    # 2) MOMENTUM
+    # MOMENTUM + late allowance
     if side == "NO-TRADE" and ENABLE_MOMENTUM_LAYER and base_side in ("LONG", "SHORT"):
         momentum_ok, momentum_reason = momentum_filter(
             side=base_side,
@@ -1038,7 +749,6 @@ def build_daily_signal(state: dict, feats: pd.DataFrame, xau: pd.DataFrame, used
             late_filter_reason = lf_reason
             late_move = lm
 
-            # smart late allowance
             late_allow_ok, late_allow_reason = momentum_late_allowance(
                 side=base_side,
                 p_adj=p_adj,
@@ -1060,7 +770,7 @@ def build_daily_signal(state: dict, feats: pd.DataFrame, xau: pd.DataFrame, used
             chart_score=chart_score,
             late_filter_reason=late_filter_reason,
             rejection_ok=rejection_ok,
-            trend_up=trend_up,
+            effective_trend=effective_trend,
             real_chg5=(real_chg5 if real_available else None),
             entry_mode=entry_mode,
             momentum_ok=momentum_ok,
@@ -1084,7 +794,8 @@ def build_daily_signal(state: dict, feats: pd.DataFrame, xau: pd.DataFrame, used
         f"IEF: {used_sources['used_ief']}\n\n"
         f"P(up): {p_up:.4f}\n"
         f"P_adj: {p_adj:.4f} ({bias_reason})\n"
-        f"Trend(>MA50): {trend_txt}\n"
+        f"Trend(>MA50): {base_trend}\n"
+        f"EffectiveTrend: {effective_trend} ({trend_source})\n"
         f"RiskGate: {risk_gate}\n"
         f"ChartScore: {chart_score}/5\n"
         f"EntryMode: {entry_mode if side != 'NO-TRADE' else ENTRY_MODE_DEFAULT}\n"
@@ -1193,14 +904,13 @@ def process_intraday_bars(state: dict, intraday: pd.DataFrame) -> tuple[dict, li
         return state, msgs
 
     for ts, row in bars.iterrows():
-        o = float(row["Open"])
         h = float(row["High"])
         l = float(row["Low"])
         c = float(row["Close"])
 
         trade = update_trade_extremes(trade, side, h, l, entry)
 
-        # OPEN
+        # Open
         if trade["status"] == "PENDING":
             triggered = False
             if side == "LONG" and h >= entry:
@@ -1224,7 +934,7 @@ def process_intraday_bars(state: dict, intraday: pd.DataFrame) -> tuple[dict, li
                     f"TP: {trade['tp']:.2f}"
                 )
 
-        # MANAGE
+        # Manage
         if trade["status"] == "OPEN" and ENABLE_AUTO_MANAGEMENT:
             current_r = r_multiple(side, entry, stop_dist, h if side == "LONG" else l)
 
@@ -1278,7 +988,7 @@ def process_intraday_bars(state: dict, intraday: pd.DataFrame) -> tuple[dict, li
                             f"New SL: {trade['sl']:.2f}"
                         )
 
-        # EXIT
+        # Exit
         if trade["status"] == "OPEN":
             current_sl = float(trade["sl"])
 
@@ -1334,23 +1044,16 @@ def process_intraday_bars(state: dict, intraday: pd.DataFrame) -> tuple[dict, li
 
 
 # ============================================================
-# DAILY REVIEW
+# DAILY REVIEW OF OPEN TRADE
 # ============================================================
-def evaluate_daily_open_trade(
-    state: dict,
-    xau_ohlc: pd.DataFrame,
-    feats: pd.DataFrame | None = None,
-    p_up_adj: float | None = None,
-) -> tuple[dict, list[str]]:
+def evaluate_daily_open_trade(state: dict, xau_ohlc: pd.DataFrame, feats: pd.DataFrame | None = None, p_up_adj: float | None = None) -> tuple[dict, list[str]]:
     msgs: list[str] = []
-
     if len(xau_ohlc) < 3:
         return state, msgs
 
     trade = state.get("trade")
     if not isinstance(trade, dict) or not trade:
         return state, msgs
-
     if trade.get("status") not in ("PENDING", "OPEN"):
         return state, msgs
 
@@ -1468,6 +1171,7 @@ def main() -> None:
         vix, used_vix = None, None
 
     feats = make_features(xau, dxy, us10y, vix, spx, tips, ief)
+    feats = compute_regime_flags(feats)
 
     if len(feats) < TRAIN_DAYS + 10:
         raise RuntimeError(f"Not enough aligned rows: {len(feats)} need~{TRAIN_DAYS}")
@@ -1521,7 +1225,7 @@ def main() -> None:
 
     p_adj = clamp01(p_up + bias)
 
-    # Daily review
+    # Daily review of active trade
     state, daily_track_msgs = evaluate_daily_open_trade(state, xau, feats=feats, p_up_adj=p_adj)
     for m in daily_track_msgs:
         send_telegram(m)
@@ -1552,7 +1256,7 @@ def main() -> None:
     }
 
     state, signal_msg = build_daily_signal(state, feats, xau, used_sources)
-    if SEND_NO_TRADE:
+    if SEND_NO_TRADE and SEND_DAILY_SIGNAL_ON_EVERY_RUN:
         send_telegram(signal_msg)
 
     save_state(state)
