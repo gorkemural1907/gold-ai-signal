@@ -176,7 +176,7 @@ ENABLE_CONTINUATION_OVERRIDE = True
 CONT_SHORT_MAX_P = 0.54
 CONT_LONG_MIN_P = 0.46
 CONT_BREAK_MOVE_ATR = 0.08
-CONT_SHORT_MAX_CLOSE_POS = 0.45
+CONT_SHORT_MAX_CLOSE_POS = 0.65
 CONT_LONG_MIN_CLOSE_POS = 0.55
 
 # Intraday execution
@@ -736,7 +736,7 @@ def continuation_override(
     if (
         effective_trend == "DOWN"
         and vol_expansion == 1
-        and close_pos <= CONT_SHORT_MAX_CLOSE_POS
+        
         and below_y_low >= CONT_BREAK_MOVE_ATR * atr
         and p_adj <= CONT_SHORT_MAX_P
     ):
