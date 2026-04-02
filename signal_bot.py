@@ -162,7 +162,7 @@ MOMENTUM_LATE_MAX_P_SHORT = 0.41
 MOMENTUM_LATE_MIN_CLOSE_POS_LONG = 0.78
 MOMENTUM_LATE_MAX_CLOSE_POS_SHORT = 0.22
 
-# Trend override / continuation fix
+# Trend override
 EMA_FAST = 20
 EMA_SLOW = 50
 ENABLE_TREND_OVERRIDE = True
@@ -171,13 +171,13 @@ TREND_OVERRIDE_MAX_CLOSE_POS_SHORT = 0.28
 TREND_OVERRIDE_MIN_P_LONG = 0.55
 TREND_OVERRIDE_MAX_P_SHORT = 0.45
 
-# NEW: breakdown / breakout override
+# NEW: continuation override
 ENABLE_CONTINUATION_OVERRIDE = True
 CONT_SHORT_MAX_P = 0.54
 CONT_LONG_MIN_P = 0.46
-CONT_BREAK_MOVE_ATR = 0.10
-CONT_SHORT_MAX_CLOSE_POS = 0.28
-CONT_LONG_MIN_CLOSE_POS = 0.72
+CONT_BREAK_MOVE_ATR = 0.08
+CONT_SHORT_MAX_CLOSE_POS = 0.45
+CONT_LONG_MIN_CLOSE_POS = 0.55
 
 # Intraday execution
 ENABLE_INTRADAY_EXECUTION = True
@@ -195,7 +195,7 @@ TRAIL_ENABLE_AT_R = 1.50
 TRAIL_LOCK_R = 0.80
 
 # ============================================================
-# SYMBOLS (Yahoo first for stability)
+# SYMBOLS (Yahoo first)
 # ============================================================
 XAU_PROVIDERS = [("yahoo", "GC=F"), ("stooq", "xauusd")]
 DXY_PROVIDERS = [("yahoo", "DX-Y.NYB"), ("stooq", "usd_i"), ("stooq", "usdidx")]
@@ -730,25 +730,26 @@ def continuation_override(
     if not ENABLE_CONTINUATION_OVERRIDE or not np.isfinite(atr) or atr <= 0:
         return "NO-TRADE", ""
 
-    # Short breakdown continuation
+    below_y_low = y_low - close_now
+    above_y_high = close_now - y_high
+
     if (
         effective_trend == "DOWN"
         and vol_expansion == 1
         and close_pos <= CONT_SHORT_MAX_CLOSE_POS
-        and close_now <= (y_low - CONT_BREAK_MOVE_ATR * atr)
+        and below_y_low >= CONT_BREAK_MOVE_ATR * atr
         and p_adj <= CONT_SHORT_MAX_P
     ):
-        return "SHORT", "breakdown continuation override"
+        return "SHORT", f"breakdown continuation override (below_y_low={below_y_low:.2f})"
 
-    # Long breakout continuation
     if (
         effective_trend == "UP"
         and vol_expansion == 1
         and close_pos >= CONT_LONG_MIN_CLOSE_POS
-        and close_now >= (y_high + CONT_BREAK_MOVE_ATR * atr)
+        and above_y_high >= CONT_BREAK_MOVE_ATR * atr
         and p_adj >= CONT_LONG_MIN_P
     ):
-        return "LONG", "breakout continuation override"
+        return "LONG", f"breakout continuation override (above_y_high={above_y_high:.2f})"
 
     return "NO-TRADE", ""
 
@@ -1045,7 +1046,6 @@ def build_daily_signal(state: dict, feats: pd.DataFrame, xau: pd.DataFrame, used
                 entry_mode = "MOMENTUM"
                 entry, sl, tp, break_level = build_trade_setup(base_side, y_high, y_low, atr, "MOMENTUM")
 
-    # NEW: continuation override if model is too neutral but breakdown/breakout is obvious
     if side == "NO-TRADE":
         over_side, over_reason = continuation_override(
             effective_trend=effective_trend,
