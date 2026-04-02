@@ -424,6 +424,268 @@ def fetch_ohlc_with_fallback(name: str, providers: list[tuple[str, str]]) -> tup
 
 
 # ============================================================
+# CORE ENGINE (MISSING FUNCTIONS)
+# ============================================================
+def make_features(
+    xau_ohlc: pd.DataFrame,
+    dxy: pd.DataFrame | None,
+    us10y: pd.DataFrame | None,
+    vix: pd.DataFrame | None,
+    spx: pd.DataFrame | None,
+    tips: pd.DataFrame | None,
+    ief: pd.DataFrame | None,
+) -> pd.DataFrame:
+    xau_ohlc = normalize_ohlc_index(xau_ohlc)
+
+    series = [xau_ohlc["Close"].rename("xau")]
+    if dxy is not None:
+        series.append(normalize_ohlc_index(dxy)["Close"].rename("dxy"))
+    if us10y is not None:
+        series.append(normalize_ohlc_index(us10y)["Close"].rename("us10y"))
+    if vix is not None:
+        series.append(normalize_ohlc_index(vix)["Close"].rename("vix"))
+    if spx is not None:
+        series.append(normalize_ohlc_index(spx)["Close"].rename("spx"))
+    if tips is not None:
+        series.append(normalize_ohlc_index(tips)["Close"].rename("tips"))
+    if ief is not None:
+        series.append(normalize_ohlc_index(ief)["Close"].rename("ief"))
+
+    df = pd.concat(series, axis=1).dropna()
+    df = df[~df.index.duplicated(keep="last")]
+
+    df = df.join(
+        xau_ohlc[["Open", "High", "Low"]].rename(
+            columns={"Open": "open_xau", "High": "high_xau", "Low": "low_xau"}
+        ),
+        how="left",
+    )
+    df = df[~df.index.duplicated(keep="last")]
+
+    df["x_ret1"] = np.log(df["xau"]).diff()
+    df["x_ret3"] = np.log(df["xau"]).diff(3)
+    df["x_ret5"] = np.log(df["xau"]).diff(5)
+
+    if "dxy" in df.columns:
+        df["dxy_ret1"] = np.log(df["dxy"]).diff()
+        df["dxy_ret5"] = np.log(df["dxy"]).diff(5)
+
+    if "us10y" in df.columns:
+        df["us10y_chg1"] = df["us10y"].diff()
+        df["us10y_chg5"] = df["us10y"].diff(5)
+        df["gold_real_spread"] = np.log(df["xau"] / df["us10y"].replace(0, np.nan))
+        df["gold_real_mom"] = df["gold_real_spread"].diff(5)
+
+    if "vix" in df.columns:
+        df["vix_ret1"] = np.log(df["vix"]).diff()
+        df["vix_ret5"] = np.log(df["vix"]).diff(5)
+
+    if "spx" in df.columns:
+        df["spx_ret5"] = np.log(df["spx"]).diff(5)
+        df["gold_spx_spread"] = np.log(df["xau"] / df["spx"].replace(0, np.nan))
+        df["gold_spx_mom"] = df["gold_spx_spread"].diff(5)
+
+    if "tips" in df.columns and "ief" in df.columns:
+        df["real_factor"] = np.log(df["tips"] / df["ief"])
+        df["real_f_chg5"] = df["real_factor"].diff(5)
+
+    atr14 = compute_atr(xau_ohlc, ATR_LEN).rename("atr14")
+    atr20 = compute_atr(xau_ohlc, ATR_SLOW_LEN).rename("atr20")
+    df = df.join(atr14, how="left")
+    df = df.join(atr20, how="left")
+    df = df[~df.index.duplicated(keep="last")]
+
+    df["ma50"] = df["xau"].rolling(50).mean()
+    df["trend_up"] = (df["xau"] > df["ma50"]).astype(int)
+
+    h = df["high_xau"]
+    l = df["low_xau"]
+    o = df["open_xau"]
+    c = df["xau"]
+
+    prev_high_max = h.shift(1).rolling(STRUCT_LOOKBACK).max()
+    prev_low_min = l.shift(1).rolling(STRUCT_LOOKBACK).min()
+
+    df["hh"] = (h > prev_high_max).astype(int)
+    df["hl"] = (l > prev_low_min).astype(int)
+    df["ll"] = (l < prev_low_min).astype(int)
+    df["lh"] = (h < prev_high_max).astype(int)
+
+    body = (c - o).abs()
+    rng = (h - l).replace(0, np.nan)
+    upper_wick = h - pd.concat([o, c], axis=1).max(axis=1)
+    lower_wick = pd.concat([o, c], axis=1).min(axis=1) - l
+
+    df["close_pos"] = ((c - l) / rng).clip(0, 1)
+    df["upper_wick_body"] = (upper_wick / body.replace(0, np.nan)).replace([np.inf, -np.inf], np.nan)
+    df["lower_wick_body"] = (lower_wick / body.replace(0, np.nan)).replace([np.inf, -np.inf], np.nan)
+
+    atr20_med = df["atr20"].rolling(SQUEEZE_LOOKBACK).median()
+    df["atr_ratio"] = df["atr14"] / atr20_med
+    df["squeeze_on"] = (df["atr_ratio"] < SQUEEZE_RATIO_MAX).astype(int)
+    df["vol_expansion"] = (
+        (df["atr_ratio"] > VOL_EXPANSION_RATIO_MIN) &
+        ((df["atr_ratio"] - df["atr_ratio"].shift(1)) > VOL_EXPANSION_MIN_DELTA)
+    ).astype(int)
+
+    df["y"] = (df["xau"].shift(-1) > df["xau"]).astype(int)
+
+    df = df.dropna()
+    df = df[~df.index.duplicated(keep="last")]
+    return df
+
+
+def chart_filters(feats: pd.DataFrame, idx: pd.Timestamp, side: str) -> tuple[bool, str, int]:
+    r = feats.loc[idx]
+    score = 0
+    reasons = []
+
+    if side == "LONG":
+        if int(r.get("hh", 0)) == 1:
+            score += 1
+        else:
+            reasons.append("no higher high")
+        if int(r.get("hl", 0)) == 1:
+            score += 1
+        else:
+            reasons.append("no higher low")
+        if float(r.get("close_pos", 0.0)) >= 0.60:
+            score += 1
+        else:
+            reasons.append("weak close position")
+    else:
+        if int(r.get("ll", 0)) == 1:
+            score += 1
+        else:
+            reasons.append("no lower low")
+        if int(r.get("lh", 0)) == 1:
+            score += 1
+        else:
+            reasons.append("no lower high")
+        if float(r.get("close_pos", 1.0)) <= 0.40:
+            score += 1
+        else:
+            reasons.append("weak close position")
+
+    passed = score >= MIN_CHART_SCORE_TO_TRADE
+    reason = "ok" if passed else "; ".join(reasons[:3]) if reasons else "score too low"
+    return passed, reason, score
+
+
+def build_trade_setup(side: str, y_high: float, y_low: float, atr: float, mode: str) -> tuple[float, float, float, float]:
+    if mode == "RETEST":
+        if side == "LONG":
+            break_level = y_high
+            entry = y_high * (1.0 + HALF_SPREAD)
+            sl = entry - STOP_ATR_MULT * atr
+            tp = entry + RR * (STOP_ATR_MULT * atr)
+        elif side == "SHORT":
+            break_level = y_low
+            entry = y_low * (1.0 - HALF_SPREAD)
+            sl = entry + STOP_ATR_MULT * atr
+            tp = entry - RR * (STOP_ATR_MULT * atr)
+        else:
+            return np.nan, np.nan, np.nan, np.nan
+        return entry, sl, tp, break_level
+
+    if mode == "MOMENTUM":
+        if side == "LONG":
+            break_level = y_high
+            entry = y_high + (MOMENTUM_BREAKOUT_BUFFER_ATR * atr)
+            sl = entry - MOMENTUM_STOP_ATR_MULT * atr
+            tp = entry + RR * (MOMENTUM_STOP_ATR_MULT * atr)
+        elif side == "SHORT":
+            break_level = y_low
+            entry = y_low - (MOMENTUM_BREAKOUT_BUFFER_ATR * atr)
+            sl = entry + MOMENTUM_STOP_ATR_MULT * atr
+            tp = entry - RR * (MOMENTUM_STOP_ATR_MULT * atr)
+        else:
+            return np.nan, np.nan, np.nan, np.nan
+        return entry, sl, tp, break_level
+
+    return np.nan, np.nan, np.nan, np.nan
+
+
+def late_entry_filter(side: str, price: float, level: float, atr: float) -> tuple[bool, str, float]:
+    if not np.isfinite(price) or not np.isfinite(level) or not np.isfinite(atr) or atr <= 0:
+        return False, "", 0.0
+    move = abs(price - level)
+    is_late = move > (atr * LATE_ENTRY_ATR_FRACTION)
+    if is_late:
+        return True, f"late entry: move {move:.2f} > {LATE_ENTRY_ATR_FRACTION:.2f}*ATR ({atr * LATE_ENTRY_ATR_FRACTION:.2f})", move
+    return False, "", move
+
+
+def rejection_filter(side: str, o: float, h: float, l: float, c: float, level: float, atr: float) -> tuple[bool, str]:
+    if not np.isfinite(atr) or atr <= 0:
+        return False, "invalid ATR"
+    body = abs(c - o)
+    if body < atr * 0.01:
+        return False, "weak body"
+
+    if side == "LONG":
+        touched = l <= level * (1.0 + RETEST_TOL_PCT)
+        bullish_close = c >= level * (1.0 + RETEST_REJECTION_BUFFER_PCT)
+        ok = touched and bullish_close
+        return ok, "ok" if ok else f"touched={touched}, bullish_close={bullish_close}"
+    else:
+        touched = h >= level * (1.0 - RETEST_TOL_PCT)
+        bearish_close = c <= level * (1.0 - RETEST_REJECTION_BUFFER_PCT)
+        ok = touched and bearish_close
+        return ok, "ok" if ok else f"touched={touched}, bearish_close={bearish_close}"
+
+
+def momentum_filter(side: str, p_adj: float, close_pos: float, vol_expansion: int, close_now: float, y_high: float, y_low: float, atr: float) -> tuple[bool, str]:
+    if side == "LONG":
+        conds = {
+            "p_adj": p_adj >= MOMENTUM_P_LONG,
+            "close_pos": close_pos >= MOMENTUM_MIN_CLOSE_POS_LONG,
+            "vol_expansion": vol_expansion == 1,
+            "breakout": close_now >= y_high + (MOMENTUM_BREAKOUT_BUFFER_ATR * atr),
+        }
+        return all(conds.values()), ", ".join([f"{k}={v}" for k, v in conds.items()])
+    else:
+        conds = {
+            "p_adj": p_adj <= MOMENTUM_P_SHORT,
+            "close_pos": close_pos <= MOMENTUM_MAX_CLOSE_POS_SHORT,
+            "vol_expansion": vol_expansion == 1,
+            "breakout": close_now <= y_low - (MOMENTUM_BREAKOUT_BUFFER_ATR * atr),
+        }
+        return all(conds.values()), ", ".join([f"{k}={v}" for k, v in conds.items()])
+
+
+def momentum_late_allowance(side: str, p_adj: float, close_pos: float, vol_expansion: int, late_move: float, atr: float) -> tuple[bool, str]:
+    if not ENABLE_MOMENTUM_LATE_ALLOWANCE:
+        return False, "disabled"
+    if not np.isfinite(atr) or atr <= 0:
+        return False, "invalid ATR"
+    late_atr = late_move / atr
+
+    if side == "LONG":
+        ok = (
+            vol_expansion == 1 and
+            p_adj >= MOMENTUM_LATE_MIN_P_LONG and
+            close_pos >= MOMENTUM_LATE_MIN_CLOSE_POS_LONG and
+            late_atr <= MOMENTUM_LATE_MAX_ATR
+        )
+    else:
+        ok = (
+            vol_expansion == 1 and
+            p_adj <= MOMENTUM_LATE_MAX_P_SHORT and
+            close_pos <= MOMENTUM_LATE_MAX_CLOSE_POS_SHORT and
+            late_atr <= MOMENTUM_LATE_MAX_ATR
+        )
+    return ok, f"late_move_atr={late_atr:.2f}, vol_expansion={vol_expansion}, p_adj={p_adj:.4f}, close_pos={close_pos:.2f}"
+
+
+def update_trade_extremes(trade: dict, side: str, high: float, low: float, entry: float) -> dict:
+    mfe, mae = calc_mfe_mae(side, entry, high, low)
+    trade["max_favorable"] = max(float(trade.get("max_favorable", 0.0) or 0.0), mfe)
+    trade["max_adverse"] = max(float(trade.get("max_adverse", 0.0) or 0.0), mae)
+    return trade
+
+
+# ============================================================
 # TREND / REGIME FIX
 # ============================================================
 def compute_regime_flags(feats: pd.DataFrame) -> pd.DataFrame:
@@ -683,7 +945,6 @@ def build_daily_signal(state: dict, feats: pd.DataFrame, xau: pd.DataFrame, used
     elif (p_adj < TH_SHORT) and ((0.5 - p_adj) >= MIN_EDGE):
         base_side = "SHORT"
 
-    # Trend alignment now uses effective trend, not only MA50
     if base_side == "LONG" and effective_trend != "UP":
         if not (ENABLE_MOMENTUM_LAYER and vol_expansion == 1 and p_adj >= MOMENTUM_P_LONG):
             base_side = "NO-TRADE"
@@ -712,7 +973,6 @@ def build_daily_signal(state: dict, feats: pd.DataFrame, xau: pd.DataFrame, used
     if base_side in ("LONG", "SHORT"):
         chart_ok, chart_reason, chart_score = chart_filters(feats, last_day, base_side)
 
-        # RETEST
         if chart_ok:
             c_entry, c_sl, c_tp, c_break = build_trade_setup(base_side, y_high, y_low, atr, "RETEST")
             if base_side == "LONG":
@@ -727,7 +987,6 @@ def build_daily_signal(state: dict, feats: pd.DataFrame, xau: pd.DataFrame, used
                 entry_mode = "RETEST"
                 entry, sl, tp, break_level = c_entry, c_sl, c_tp, c_break
 
-    # MOMENTUM + late allowance
     if side == "NO-TRADE" and ENABLE_MOMENTUM_LAYER and base_side in ("LONG", "SHORT"):
         momentum_ok, momentum_reason = momentum_filter(
             side=base_side,
@@ -910,7 +1169,6 @@ def process_intraday_bars(state: dict, intraday: pd.DataFrame) -> tuple[dict, li
 
         trade = update_trade_extremes(trade, side, h, l, entry)
 
-        # Open
         if trade["status"] == "PENDING":
             triggered = False
             if side == "LONG" and h >= entry:
@@ -934,7 +1192,6 @@ def process_intraday_bars(state: dict, intraday: pd.DataFrame) -> tuple[dict, li
                     f"TP: {trade['tp']:.2f}"
                 )
 
-        # Manage
         if trade["status"] == "OPEN" and ENABLE_AUTO_MANAGEMENT:
             current_r = r_multiple(side, entry, stop_dist, h if side == "LONG" else l)
 
@@ -988,7 +1245,6 @@ def process_intraday_bars(state: dict, intraday: pd.DataFrame) -> tuple[dict, li
                             f"New SL: {trade['sl']:.2f}"
                         )
 
-        # Exit
         if trade["status"] == "OPEN":
             current_sl = float(trade["sl"])
 
@@ -1225,12 +1481,10 @@ def main() -> None:
 
     p_adj = clamp01(p_up + bias)
 
-    # Daily review of active trade
     state, daily_track_msgs = evaluate_daily_open_trade(state, xau, feats=feats, p_up_adj=p_adj)
     for m in daily_track_msgs:
         send_telegram(m)
 
-    # Intraday execution / management
     if ENABLE_INTRADAY_EXECUTION and state.get("trade", {}).get("status") in ("PENDING", "OPEN"):
         try:
             intraday = fetch_intraday_yahoo(YAHOO_INTRADAY_SYMBOL)
