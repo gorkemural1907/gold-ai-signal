@@ -107,7 +107,7 @@ def save_state(state: dict) -> None:
 # ============================================================
 SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": "Mozilla/5.0"})
-FETCH_PAUSE_S = 0.25
+FETCH_PAUSE_S = 0.20
 
 
 # ============================================================
@@ -171,6 +171,11 @@ TREND_OVERRIDE_MAX_CLOSE_POS_SHORT = 0.28
 TREND_OVERRIDE_MIN_P_LONG = 0.55
 TREND_OVERRIDE_MAX_P_SHORT = 0.45
 
+# NEW: stronger long turn override
+TURN_LONG_MIN_P = 0.66
+TURN_LONG_MIN_CLOSE_POS = 0.52
+TURN_LONG_MIN_REAL_MOM = 0.02
+
 # Continuation override
 ENABLE_CONTINUATION_OVERRIDE = True
 CONT_SHORT_MAX_P = 0.56
@@ -179,7 +184,7 @@ CONT_BREAK_MOVE_ATR = 0.05
 CONT_SHORT_MAX_CLOSE_POS = 0.65
 CONT_LONG_MIN_CLOSE_POS = 0.55
 
-# NEW: live continuation entry
+# Live continuation entry
 ENABLE_LIVE_CONTINUATION_ENTRY = True
 LIVE_ENTRY_MAX_ATR = 0.25
 
@@ -567,11 +572,25 @@ def detect_effective_trend(r: pd.Series, p_adj: float) -> tuple[str, str]:
     if not ENABLE_TREND_OVERRIDE:
         return base_trend, "ma50"
 
+    # strong continuation overrides
     if int(r.get("trend_override_up", 0)) == 1 and p_adj >= TREND_OVERRIDE_MIN_P_LONG:
         return "UP", "override_up"
 
     if int(r.get("trend_override_down", 0)) == 1 and p_adj <= TREND_OVERRIDE_MAX_P_SHORT:
         return "DOWN", "override_down"
+
+    # NEW: strong long turn override even if MA50 still down
+    gold_real_mom = float(r.get("gold_real_mom", 0.0))
+    close_pos = float(r.get("close_pos", 0.0))
+    vol_expansion = int(r.get("vol_expansion", 0))
+
+    if (
+        p_adj >= TURN_LONG_MIN_P
+        and vol_expansion == 1
+        and gold_real_mom >= TURN_LONG_MIN_REAL_MOM
+        and close_pos >= TURN_LONG_MIN_CLOSE_POS
+    ):
+        return "UP", "turn_long_override"
 
     return base_trend, "ma50"
 
@@ -767,10 +786,6 @@ def continuation_override(
 
 
 def maybe_use_live_continuation_entry(side: str, entry: float, close_now: float, atr: float) -> tuple[bool, bool, float, str]:
-    """
-    returns:
-    use_live, too_stretched, live_entry, reason
-    """
     if not ENABLE_LIVE_CONTINUATION_ENTRY or not np.isfinite(entry) or not np.isfinite(close_now) or not np.isfinite(atr) or atr <= 0:
         return False, False, entry, ""
 
@@ -1105,7 +1120,6 @@ def build_daily_signal(state: dict, feats: pd.DataFrame, xau: pd.DataFrame, used
             override_reason = over_reason
             entry, sl, tp, break_level = build_trade_setup(over_side, y_high, y_low, atr, "MOMENTUM")
 
-    # NEW: if momentum/continuation entry is stale, switch to live entry or reject if stretched
     if side in ("LONG", "SHORT") and entry_mode == "MOMENTUM":
         use_live, too_stretched, live_entry, live_reason = maybe_use_live_continuation_entry(
             side=side,
@@ -1118,7 +1132,6 @@ def build_daily_signal(state: dict, feats: pd.DataFrame, xau: pd.DataFrame, used
             stale_reason = live_reason
             side = "NO-TRADE"
             grade = "N/A"
-            entry_mode = "MOMENTUM"
             entry = float(close_now)
             sl = float("nan")
             tp = float("nan")
@@ -1166,7 +1179,7 @@ def build_daily_signal(state: dict, feats: pd.DataFrame, xau: pd.DataFrame, used
         f"EffectiveTrend: {effective_trend} ({trend_source})\n"
         f"RiskGate: {risk_gate}\n"
         f"ChartScore: {chart_score}/5\n"
-        f"EntryMode: {entry_mode if side != 'NO-TRADE' else entry_mode}\n"
+        f"EntryMode: {entry_mode}\n"
         f"HasActiveTrade: {has_active_trade}\n"
     )
 
@@ -1480,7 +1493,7 @@ def evaluate_daily_open_trade(state: dict, xau_ohlc: pd.DataFrame, feats: pd.Dat
             return state, msgs
 
     if trade.get("status") == "OPEN" and feats is not None and p_up_adj is not None and last_bar_date in feats.index:
-        chart_ok, chart_reason, chart_score = chart_filters(feats, last_bar_date, side)
+        _, chart_reason, chart_score = chart_filters(feats, last_bar_date, side)
         exit_now = False
         exit_reason = ""
 
