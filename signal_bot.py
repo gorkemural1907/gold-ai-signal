@@ -180,10 +180,10 @@ LIVE_ENTRY_MAX_ATR = 0.25
 # NEW: conflict veto + reclaim reversal
 ENABLE_CONFLICT_VETO = True
 RECLAIM_LONG_MIN_P = 0.62
-RECLAIM_LONG_MIN_CLOSE_POS = 0.58
+RECLAIM_LONG_MIN_CLOSE_POS = 0.45
 RECLAIM_SHORT_MAX_P = 0.38
 RECLAIM_SHORT_MAX_CLOSE_POS = 0.42
-RECLAIM_BUFFER_ATR = 0.03
+RECLAIM_BUFFER_ATR = 0.02
 RECLAIM_STOP_ATR_MULT = 1.0
 
 ENABLE_INTRADAY_EXECUTION = True
@@ -723,10 +723,10 @@ def reclaim_reversal_signal(base_side: str, p_adj: float, close_now: float, y_hi
     if not np.isfinite(atr) or atr <= 0:
         return "NO-TRADE", ""
     if base_side == "LONG":
-        if p_adj >= RECLAIM_LONG_MIN_P and close_pos >= RECLAIM_LONG_MIN_CLOSE_POS and close_now >= y_low + RECLAIM_BUFFER_ATR * atr:
+        if p_adj >= RECLAIM_LONG_MIN_P and close_now >= y_low + RECLAIM_BUFFER_ATR * atr:
             return "LONG", "failed breakdown reclaim"
     if base_side == "SHORT":
-        if p_adj <= RECLAIM_SHORT_MAX_P and close_pos <= RECLAIM_SHORT_MAX_CLOSE_POS and close_now <= y_high - RECLAIM_BUFFER_ATR * atr:
+        if p_adj <= RECLAIM_SHORT_MAX_P and close_now <= y_high - RECLAIM_BUFFER_ATR * atr:
             return "SHORT", "failed breakout reclaim"
     return "NO-TRADE", ""
 
